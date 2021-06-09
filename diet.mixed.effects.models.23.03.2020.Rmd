@@ -1,0 +1,2222 @@
+---
+title: "UK Biobank Diet - Mixed-Effects Models"
+author: "Avina Hunjan"
+date: "23/03/2020"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+# Set up
+```{r Setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Delete everything in your global environment}
+remove(list = ls())
+```
+
+```{r Retrieve the recent date}
+date = Sys.Date()
+date
+```
+
+```{r Packages}
+library(data.table)
+library(googlesheets4)
+library(magrittr)
+library(dplyr)
+library(matrixStats)
+library(lme4)
+library(lmerTest)  
+library(tidyverse)
+library(summarytools)
+library(ggplot2)
+library(polycor)
+library(kableExtra)
+library(corrplot)
+library(writexl)
+library(gtools)
+library(psycho)
+library(MuMIn)
+```
+
+```{r Read in google spreadsheet}
+diet_url <- "https://docs.google.com/spreadsheets/d/1UQ6YQtyglaihP0iA1IgYKAlYFFxlLkassLvotLU1NpM/edit#gid=0" 
+# estimated nutritional intake 
+diet_sheet <- read_sheet(diet_url, col_types = "c", sheet = 18)
+```
+
+```{r var for function}
+nutrient_names <- as.vector(diet_sheet$Description %>%
+               str_split("\\s") %>%
+               map_chr(nth, 1) %>%
+               unique())
+
+var <- nutrient_names
+```
+
+```{r Read in data}
+estimated_nut <- fread("../data_raw/estimated.nutrition.diet.items.cleaned.txt", data.table = F, header = T)
+diet_non_array <- fread("../data_raw/non.array.diet.items.cleaned.txt", data.table = F, header = T)
+covariates <- fread("../data_raw/food.covariates.txt", data.table = F, header = T)
+ICD10 <- fread("../data_raw/medication_diagnoses_cancer.ICD10.txt", data.table = F, header = T)
+noncancerSR <- fread("../data_raw/noncancer_SRillness.txt", data.table = F, header = T)
+cancerSR <- fread("../data_raw/SRcancer.txt", data.table = F, header = T)
+PRS <- fread("../data_raw/PRS.0.2.txt", data.table = F, header = T)
+```
+
+# Covariates 
+```{r Rename headers}
+covariates <- covariates %>%
+  rename("Age" = Age.at.recruitment.0.0) %>%
+  rename("Sex" = Sex.0.0) %>%
+  rename("SES" = Townsend.deprivation.index.at.recruitment.0.0) %>%
+  rename("menopause.uncleaned" = Had.menopause.0.0) %>%
+  rename("pregnant.uncleaned" = Pregnant.0.0) %>%
+  rename("tobacco.uncleaned" = Current.tobacco.smoking.0.0) %>%
+  rename("alcohol.uncleaned" = Alcohol.intake.frequency.0.0)
+```
+
+```{r SES}
+#town deprivation index = lower the value the better 
+covariates$SES <-(covariates$SES * -1)
+```
+
+```{r Menopause}
+# Empty column
+covariates["Menopause"] <- NA
+
+# Male & NA
+covariates <- within(covariates, Menopause[Sex == 1 & is.na(menopause.uncleaned)] <- 0)
+# Female & NA
+covariates <- within(covariates, Menopause[Sex == 0 & is.na(menopause.uncleaned)] <- 1)
+# Female & Yes
+covariates <- within(covariates, Menopause[Sex == 0 & menopause.uncleaned == 1] <- 2)
+# Female & Hysterectomy
+covariates <- within(covariates, Menopause[Sex == 0 & menopause.uncleaned == 2] <- 3)
+# Female & Not sure
+covariates <- within(covariates, Menopause[Sex == 0 & menopause.uncleaned == 3] <- 4)
+# Female & Prefer not to answer
+covariates <- within(covariates, Menopause[Sex == 0 & menopause.uncleaned == -3] <- 5)
+# Female & No
+covariates <- within(covariates, Menopause[Sex == 0 & menopause.uncleaned == 0] <- 6)
+# Recode as factor
+covariates$Menopause <- factor(covariates$Menopause, levels=c("0", "1", "2", "3", "4", "5", "6"))
+
+# Delete Menopause
+covariates$menopause.uncleaned <- NULL
+```
+
+```{r Pregnant}
+covariates["Pregnant"] <- NA
+# Male & NA
+covariates <- within(covariates, Pregnant[Sex == 1 & is.na(pregnant.uncleaned)] <- 0)
+# Female & NA
+covariates <- within(covariates, Pregnant[Sex == 0 & is.na(pregnant.uncleaned)] <- 1)
+# Female & No
+covariates <- within(covariates, Pregnant[Sex == 0 & pregnant.uncleaned == 0] <- 2)
+# Female & Yes
+covariates <- within(covariates, Pregnant[Sex == 0 & pregnant.uncleaned == 1] <- 3)
+# Female & Not sure
+covariates <- within(covariates, Pregnant[Sex == 0 & pregnant.uncleaned == 2] <- 4)
+# Recode as factor
+covariates$Pregnant <- factor(covariates$Pregnant, levels=c("0", "1", "2", "3", "4"))
+
+# Delete old Pregnancy column
+covariates$Pregnant.uncleaned <- NULL
+```
+
+```{r Tobacco}
+covariates["Tobacco"] <- NA
+# Prefer no to answer
+covariates <- within(covariates, Tobacco[tobacco.uncleaned == -3] <- 0)
+# No
+covariates <- within(covariates, Tobacco[tobacco.uncleaned == 0] <- 1)
+# Only occasionally
+covariates <- within(covariates, Tobacco[tobacco.uncleaned == 2] <- 2)
+# Yes, on most or all days
+covariates <- within(covariates, Tobacco[tobacco.uncleaned == 1] <- 3)
+
+# Recode as factor
+covariates$Tobacco <- factor(covariates$Tobacco, levels=c("0", "1", "2", "3"))
+
+# Delete old tobacco column
+covariates$tobacco.uncleaned <- NULL
+```
+
+```{r Alcohol}
+covariates["freq.alcohol"] <- NA
+
+# Prefer no to answer
+covariates <- within(covariates, freq.alcohol[alcohol.uncleaned == -3] <- 0)
+# Never
+covariates <- within(covariates, freq.alcohol[alcohol.uncleaned == 6] <- 1)
+# Special occasions only
+covariates <- within(covariates, freq.alcohol[alcohol.uncleaned == 5] <- 2)
+# One to three times a month
+covariates <- within(covariates, freq.alcohol[alcohol.uncleaned == 4] <- 3)
+# Once or twice a week
+covariates <- within(covariates, freq.alcohol[alcohol.uncleaned == 3] <- 4)
+# Three or four times a week
+covariates <- within(covariates, freq.alcohol[alcohol.uncleaned == 2] <- 5)
+# 	Daily or almost daily
+covariates <- within(covariates, freq.alcohol[alcohol.uncleaned == 1] <- 6)
+
+# Recode as factor
+covariates$freq.alcohol <- factor(covariates$freq.alcohol, levels=c("0", "1", "2", "3", "4", "5", "6"))
+
+# Delete old alcohol column
+covariates$alcohol.uncleaned <- NULL
+```
+
+```{r Educational attainment}
+# none of the above (no qualifications) = 7 years of education
+covariates$Qualifications.0.0[covariates$Qualifications.0.0=="-7"]<-7
+covariates$Qualifications.0.1[covariates$Qualifications.0.1=="-7"]<-7
+covariates$Qualifications.0.2[covariates$Qualifications.0.2=="-7"]<-7
+covariates$Qualifications.0.3[covariates$Qualifications.0.3=="-7"]<-7
+covariates$Qualifications.0.4[covariates$Qualifications.0.4=="-7"]<-7
+covariates$Qualifications.0.5[covariates$Qualifications.0.5=="-7"]<-7
+
+# Certificate of Secondary Education (CSEs) or equivalent / O levels/GCSEs or equivalent = 10 years (only 4 or 3 in any column)
+covariates$Qualifications.0.0[covariates$Qualifications.0.0=="4"]<-10
+covariates$Qualifications.0.1[covariates$Qualifications.0.1=="4"]<-10
+covariates$Qualifications.0.2[covariates$Qualifications.0.2=="4"]<-10
+covariates$Qualifications.0.3[covariates$Qualifications.0.3=="4"]<-10
+covariates$Qualifications.0.4[covariates$Qualifications.0.4=="4"]<-10
+covariates$Qualifications.0.5[covariates$Qualifications.0.5=="4"]<-10
+
+covariates$Qualifications.0.0[covariates$Qualifications.0.0=="3"]<-10
+covariates$Qualifications.0.1[covariates$Qualifications.0.1=="3"]<-10
+covariates$Qualifications.0.2[covariates$Qualifications.0.2=="3"]<-10
+covariates$Qualifications.0.3[covariates$Qualifications.0.3=="3"]<-10
+covariates$Qualifications.0.4[covariates$Qualifications.0.4=="3"]<-10
+covariates$Qualifications.0.5[covariates$Qualifications.0.5=="3"]<-10
+
+# A levels/AS levels or equivalent = 13 years
+covariates$Qualifications.0.0[covariates$Qualifications.0.0=="2"]<-13
+covariates$Qualifications.0.1[covariates$Qualifications.0.1=="2"]<-13
+covariates$Qualifications.0.2[covariates$Qualifications.0.2=="2"]<-13
+covariates$Qualifications.0.3[covariates$Qualifications.0.3=="2"]<-13
+covariates$Qualifications.0.4[covariates$Qualifications.0.4=="2"]<-13
+covariates$Qualifications.0.5[covariates$Qualifications.0.5=="2"]<-13
+
+# other professional qualification = 15 years
+covariates$Qualifications.0.0[covariates$Qualifications.0.0=="6"]<-15
+covariates$Qualifications.0.1[covariates$Qualifications.0.1=="6"]<-15
+covariates$Qualifications.0.2[covariates$Qualifications.0.2=="6"]<-15
+covariates$Qualifications.0.3[covariates$Qualifications.0.3=="6"]<-15
+covariates$Qualifications.0.4[covariates$Qualifications.0.4=="6"]<-15
+covariates$Qualifications.0.5[covariates$Qualifications.0.5=="6"]<-15
+
+# National Vocational Qualification (NVQ) or Higher National Diploma (HNC) or equivalent = 19 years
+covariates$Qualifications.0.0[covariates$Qualifications.0.0=="5"]<-19
+covariates$Qualifications.0.1[covariates$Qualifications.0.1=="5"]<-19
+covariates$Qualifications.0.2[covariates$Qualifications.0.2=="5"]<-19
+covariates$Qualifications.0.3[covariates$Qualifications.0.3=="5"]<-19
+covariates$Qualifications.0.4[covariates$Qualifications.0.4=="5"]<-19
+covariates$Qualifications.0.5[covariates$Qualifications.0.5=="5"]<-19
+
+# college or university degree = 20 years of education
+covariates$Qualifications.0.0[covariates$Qualifications.0.0=="1"]<-20
+covariates$Qualifications.0.1[covariates$Qualifications.0.1=="1"]<-20
+covariates$Qualifications.0.2[covariates$Qualifications.0.2=="1"]<-20
+covariates$Qualifications.0.3[covariates$Qualifications.0.3=="1"]<-20
+covariates$Qualifications.0.4[covariates$Qualifications.0.4=="1"]<-20
+covariates$Qualifications.0.5[covariates$Qualifications.0.5=="1"]<-20
+
+#prefer not to answer
+covariates$Qualifications.0.0[covariates$Qualifications.0.0=="-3"]<-NA
+covariates$Qualifications.0.1[covariates$Qualifications.0.1=="-3"]<-NA
+covariates$Qualifications.0.2[covariates$Qualifications.0.2=="-3"]<-NA
+covariates$Qualifications.0.3[covariates$Qualifications.0.3=="-3"]<-NA
+covariates$Qualifications.0.4[covariates$Qualifications.0.4=="-3"]<-NA
+covariates$Qualifications.0.5[covariates$Qualifications.0.5=="-3"]<-NA
+
+covariates$Education <- rowMaxs(as.matrix(covariates$Qualifications.0.0, covariates$Qualifications.0.1, covariates$Qualifications.0.2, covariates$Qualifications.0.3, covariates$Qualifications.0.4, covariates$Qualifications.0.5))
+
+# Recode as factor
+covariates$Education <- factor(covariates$Education, levels=c("7", "10", "13", "15", "19", "20"))
+
+# Delete old qualification columns
+covariates <- select(covariates, -contains("Qualifications"))
+```
+
+```{r Special diet followed}
+# create new columns in existing dataframe
+names <- "Special.diet"
+tp <- c("0.0", "1.0", "2.0", "3.0", "4.0")
+
+column.names <- as.vector(sapply(names, function(x) paste(x, tp, sep='.')))
+covariates[,column.names] <- NA
+
+# replaces NA's with 0 if partipants answered the diet questionnaire (all participants would have answered the typical diet yesterday)
+cols_0 <- paste0(names, ".0.0")
+covariates[cols_0] <- lapply(covariates[cols_0], function(x) ifelse(!is.na(covariates$Typical.diet.yesterday.0.0), 0, NA))
+
+cols_1 <- paste0(names, ".1.0")
+covariates[cols_1] <- lapply(covariates[cols_1], function(x) ifelse(!is.na(covariates$Typical.diet.yesterday.1.0), 0, NA))
+
+cols_2 <- paste0(names, ".2.0")
+covariates[cols_2] <- lapply(covariates[cols_2], function(x) ifelse(!is.na(covariates$Typical.diet.yesterday.2.0), 0, NA))
+
+cols_3 <- paste0(names, ".3.0")
+covariates[cols_3] <- lapply(covariates[cols_3], function(x) ifelse(!is.na(covariates$Typical.diet.yesterday.3.0), 0, NA))
+
+cols_4 <- paste0(names, ".4.0")
+covariates[cols_4] <- lapply(covariates[cols_4], function(x) ifelse(!is.na(covariates$Typical.diet.yesterday.4.0), 0, NA))
+
+# 0.0
+covariates <- within(covariates, Special.diet.0.0[!is.na(Type.of.special.diet.followed.0.0) | !is.na(Type.of.special.diet.followed.0.1) | !is.na(Type.of.special.diet.followed.0.2) | !is.na(Type.of.special.diet.followed.0.3) | !is.na(Type.of.special.diet.followed.0.4) | !is.na(Type.of.special.diet.followed.0.5)] <- 1)
+
+# 1.0
+covariates <- within(covariates, Special.diet.1.0[!is.na(Type.of.special.diet.followed.1.0) | !is.na(Type.of.special.diet.followed.1.1) | !is.na(Type.of.special.diet.followed.1.2) | !is.na(Type.of.special.diet.followed.1.3) | !is.na(Type.of.special.diet.followed.1.4) | !is.na(Type.of.special.diet.followed.1.5)] <- 1)
+
+# 2.0
+covariates <- within(covariates, Special.diet.2.0[!is.na(Type.of.special.diet.followed.2.0) | !is.na(Type.of.special.diet.followed.2.1) | !is.na(Type.of.special.diet.followed.2.2) | !is.na(Type.of.special.diet.followed.2.3) | !is.na(Type.of.special.diet.followed.2.4) | !is.na(Type.of.special.diet.followed.2.5)] <- 1)
+
+# 3.0
+covariates <- within(covariates, Special.diet.3.0[!is.na(Type.of.special.diet.followed.3.0) | !is.na(Type.of.special.diet.followed.3.1) | !is.na(Type.of.special.diet.followed.3.2) | !is.na(Type.of.special.diet.followed.3.3) | !is.na(Type.of.special.diet.followed.3.4) | !is.na(Type.of.special.diet.followed.3.5)] <- 1)
+
+# 4.0
+covariates <- within(covariates, Special.diet.4.0[!is.na(Type.of.special.diet.followed.4.0) | !is.na(Type.of.special.diet.followed.4.1) | !is.na(Type.of.special.diet.followed.4.2) | !is.na(Type.of.special.diet.followed.4.3) | !is.na(Type.of.special.diet.followed.4.4) | !is.na(Type.of.special.diet.followed.4.5)] <- 1)
+
+# Delete old special diet followed columns
+covariates <- select(covariates, -contains("Type.of.special.diet.followed"))
+```
+
+```{r diagnoses/medication affecting body composition} 
+# ICD10 diagnoses/medication affecting body composition
+colnames(ICD10)[1] <- "FID"
+ICD10$IID <- ICD10$FID 
+ICD10.diag.med.binary <- ICD10[c(1,52,2,3)]  
+
+ICD10.diag.med.binary <- ICD10.diag.med.binary %>%
+  rename("ICD10.disease" = has_disease) %>%
+  rename("ICD10.drug" = has_drug)
+
+ICD10.diag.med.binary$ICD10.disease <- as.factor(ICD10.diag.med.binary$ICD10.disease)
+ICD10.diag.med.binary$ICD10.drug <- as.factor(ICD10.diag.med.binary$ICD10.drug)
+```
+
+```{r noncancer self-reported diagnoses affecting body composition}
+#Vector with codes for self-reported illness affecting body composition
+noncancerSR_exclusion = c(1136, 1154, 1155, 1156, 1157, 1158, 1164, 1165, 1192,
+                     1193, 1194, 1220, 1222, 1223, 1224, 1225, 1226, 1228,
+                     1229, 1230, 1232, 1233, 1234, 1235, 1236, 1237, 1238,
+                     1239, 1243, 1252, 1259, 1260, 1262, 1263, 1276, 1286,
+                     1287, 1289, 1290, 1291, 1293, 1297, 1308, 1309, 1310,
+                     1313, 1322, 1350, 1373, 1376, 1377, 1378, 1379, 1380,
+                     1381, 1382, 1383, 1384, 1403, 1404, 1408, 1409, 1410,
+                     1428, 1429, 1430, 1431, 1432, 1437, 1439, 1440, 1456,
+                     1461, 1462, 1463, 1464, 1468, 1469, 1470, 1477, 1480,
+                     1481, 1519, 1520, 1521, 1522, 1531, 1556, 1579, 1580,
+                     1604, 1607, 1608, 1609, 1611, 1615, 1617, 1657, 1664, 1682)
+
+# Any visit
+noncancerSR$noncancerSR <- 
+  with(noncancerSR, ifelse(!(Non.cancer.illness.code.self.reported.0.0 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.0.1 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.0.2 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.0.3 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.0.4 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.0.5 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.0.6 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.0.7 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.0.8 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.0.9 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.0.10 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.0.11 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.0.12 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.0.13 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.0.14 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.0.15 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.0.16 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.0.17 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.0.18 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.0.19 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.0.20 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.0.21 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.0.22 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.0.23 %in% noncancerSR_exclusion) & 
+           !(Non.cancer.illness.code.self.reported.0.24 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.0.25 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.0.26 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.0.27 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.0.28 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.1.0 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.1.1 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.1.2 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.1.3 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.1.4 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.1.5 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.1.6 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.1.7 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.1.8 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.1.9 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.1.10 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.1.11 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.1.12 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.1.13 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.1.14 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.1.15 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.2.0 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.2.1 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.2.2 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.2.3 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.2.4 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.2.5 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.2.6 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.2.7 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.2.8 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.2.9 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.2.10 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.2.11 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.2.12 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.2.13 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.2.14 %in% noncancerSR_exclusion) &
+           !(Non.cancer.illness.code.self.reported.2.15 %in% noncancerSR_exclusion) & !(Non.cancer.illness.code.self.reported.2.16 %in% noncancerSR_exclusion),
+         0, 1))
+
+table(noncancerSR$noncancerSR)
+```
+
+```{r noncancer self-reported diagnoses - create new data.frame}
+colnames(noncancerSR)[1] <- "FID"
+noncancerSR$IID <- noncancerSR$FID 
+noncancerSR.binary <- noncancerSR[c(1,2,90)]   
+
+noncancerSR.binary$noncancerSR <- as.factor(noncancerSR.binary$noncancerSR)
+```
+ 
+```{r self-reported cancer affecting body composition}
+cancerSR_cols <- colnames(cancerSR[,-1])
+
+# Create new binary column for self-reported cancer
+cancerSR$SRAnyCancer <- apply(cancerSR[,cancerSR_cols] == 1, 1, any)
+
+# Recode as factor
+cancerSR$SRAnyCancer <- factor(cancerSR$SRAnyCancer, labels = c(0,1))
+
+# Vector with codes for self-reported cancer to exclude for body composition
+cancerSRBC_exclusion <-c(1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 
+                    1012, 1015, 1016, 1017, 1018, 1019, 1020, 1021, 1022, 1023, 1024, 
+                    1025, 1026, 1027, 1028, 1031, 1032, 1033, 1034, 1035, 1036, 1037,
+                    1038, 1039, 1040, 1041, 1042, 1043, 1044, 1045, 1046, 1047, 1048,
+                    1050, 1051, 1052, 1053, 1055, 1056, 1058, 1059, 1060, 1061, 1062,
+                    1063, 1064, 1065, 1066, 1067, 1068, 1070, 1071, 1073, 1074, 1075,
+                    1076, 1077, 1078, 1079, 1080, 1081, 1082, 1084, 1085, 1086, 1087, 1088)
+
+# Create data frame that only contains the columns for extraction
+cancerSRBC <- select(.data = cancerSR, IID, matches(paste(cancerSRBC_exclusion, collapse = "|")))
+
+# Create new binary column if relevant for exclusion for body composition
+cancerSR$SRAnyCancerBC <- apply(cancerSRBC[,-1] == 1, 1, any)
+
+# Recode as factor
+cancerSR$SRAnyCancerBC <- factor(cancerSR$SRAnyCancerBC, labels = c(0,1))
+
+summary(cancerSR$SRAnyCancerBC)
+```
+
+```{r self-reported cancer affecting body composition - create new data.frame}
+colnames(cancerSR)[1] <- "FID"
+cancerSR$IID <- cancerSR$FID 
+cancerSRBC.binary <- cancerSR[c(1,215,214)] 
+```
+
+```{r physical activity}
+activity_items <- diet_non_array[,c("FID", "IID", "Time.spent.doing.light.physical.activity.0.0", "Time.spent.doing.light.physical.activity.1.0", "Time.spent.doing.light.physical.activity.2.0", "Time.spent.doing.light.physical.activity.3.0", "Time.spent.doing.light.physical.activity.4.0", "Time.spent.doing.moderate.physical.activity.0.0", "Time.spent.doing.moderate.physical.activity.1.0", "Time.spent.doing.moderate.physical.activity.2.0", "Time.spent.doing.moderate.physical.activity.3.0", "Time.spent.doing.moderate.physical.activity.4.0", "Time.spent.doing.vigorous.physical.activity.0.0", "Time.spent.doing.vigorous.physical.activity.1.0", "Time.spent.doing.vigorous.physical.activity.2.0", "Time.spent.doing.vigorous.physical.activity.3.0", "Time.spent.doing.vigorous.physical.activity.4.0")]
+```
+
+# Data formatting
+```{r merge all files}
+data <- merge(estimated_nut, covariates, by = c("FID", "IID"))
+data <- merge(data, activity_items, by = c("FID", "IID"))
+data <- merge(data, ICD10.diag.med.binary, by = c("FID", "IID"))
+data <- merge(data, noncancerSR.binary, by = c("FID", "IID"))
+data <- merge(data, cancerSRBC.binary, by = c("FID", "IID"))
+data <- merge(data, PRS, by = c("FID", "IID"))
+```
+
+```{r reformat data}
+# wide to long 
+diet_new <- melt(setDT(data),id=c("FID","IID","Anorexia.nervosa","ADHD","OCD","Educational.attainment","Schizophrenia","Alcohol.dependence","Major.depressive.disorder", "Autism.spectrum.disorder", "Bipolar.disorder","Food.addiction","Persistent.thinness","Height","BMI","Lupus","Sex","Age","SES","PC1","PC2","PC3","PC4","PC5","PC6","batch","Centre","Menopause","Pregnant","Tobacco","freq.alcohol","Education","ICD10.disease","ICD10.drug","noncancerSR","SRAnyCancerBC"),measure = patterns("^Typical.diet.yesterday","^Special.diet","^Time.spent.doing.light.physical.activity","^Time.spent.doing.moderate.physical.activity","^Time.spent.doing.vigorous.physical.activity","^Protein","^Energy","^Alcohol","^Calcium","^Carbohydrate","^Carotene","^Englyst.dietary.fibre","^Fat","^Folate","^Food.weight","^Iron","^Magnesium","^Polyunsaturated.fat","^Potassium","^Retinol","^Saturated.fat","^Starch","^Total.sugars","^Vitamin.B12","^Vitamin.B6","^Vitamin.C","^Vitamin.D","^Vitamin.E"),value.name = c("Typical.diet.yesterday","Special.diet","Time.spent.doing.light.physical.activity","Time.spent.doing.moderate.physical.activity","Time.spent.doing.vigorous.physical.activity","Protein","Energy","Alcohol","Calcium","Carbohydrate","Carotene","Englyst.dietary.fibre","Fat","Folate","Food.weight","Iron","Magnesium","Polyunsaturated.fat","Potassium","Retinol","Saturated.fat","Starch","Total.sugars","Vitamin.B12","Vitamin.B6","Vitamin.C","Vitamin.D","Vitamin.E"))[,variable := NULL][]
+
+# remove rows with incomplete data
+diet_new <- na.omit(diet_new)
+
+# as.data.frame
+diet_new <- as.data.frame(diet_new)
+```
+
+```{r recode as factor}
+# Convert binary/nominal input to a factor
+diet_new$Sex <- as.factor(diet_new$Sex)
+diet_new$batch <- as.factor(diet_new$batch)
+diet_new$Centre <- as.factor(diet_new$Centre)
+diet_new$Typical.diet.yesterday <- as.factor(diet_new$Typical.diet.yesterday)
+diet_new$Special.diet <- as.factor(diet_new$Special.diet)
+diet_new$Time.spent.doing.light.physical.activity <- factor(diet_new$Time.spent.doing.light.physical.activity, levels=c("0", "1", "2", "3", "4", "5", "6", "7"))
+diet_new$Time.spent.doing.moderate.physical.activity <- factor(diet_new$Time.spent.doing.moderate.physical.activity, levels=c("0", "1", "2", "3", "4", "5", "6", "7"))
+diet_new$Time.spent.doing.vigorous.physical.activity<- factor(diet_new$Time.spent.doing.vigorous.physical.activity, levels=c("0", "1", "2", "3", "4", "5", "6", "7"))
+```
+
+```{r exclude pregnant females}
+table(diet_new$Pregnant) # 3 = female and pregnant, 4 = female and not sure.
+
+# remove pregnant females and those that were not sure. 
+diet_new <- filter(diet_new, !(Pregnant %in% c("3", "4")))
+#check
+table(diet_new$Pregnant)
+
+#remove pregnant column 
+diet_new <- select(diet_new, -Pregnant)
+
+#write.table(diet_new, file="../data_raw/reformatted.data.exluding.pregnant.females.txt", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+# Exclusion steps (Table 1 in Manscript)
+```{r Number of participants who completed the diet questionnaire at least once}
+estimated_nut$na_count <- apply(estimated_nut, 1, function(x) sum(is.na(x)))
+
+#if NA count is 115 then partipicant never completed the questionnaire
+estimated_nut_atleastonce <- filter(estimated_nut, na_count != 115)
+nrow(estimated_nut_atleastonce)
+```
+
+```{r how many had genotype data?}
+estimated_nut_atleastonce_geno <- merge(estimated_nut_atleastonce, covariates, by = c("FID", "IID"))
+nrow(estimated_nut_atleastonce_geno) #retained
+nrow(estimated_nut_atleastonce) - nrow(estimated_nut_atleastonce_geno)  #dropped
+```
+
+```{r How many were pregnant?}
+estimated_nut_atleastonce_geno_preg <- filter(estimated_nut_atleastonce_geno, Pregnant != 3 & Pregnant != 4)
+nrow(estimated_nut_atleastonce_geno_preg) #retained
+nrow(estimated_nut_atleastonce_geno) - nrow(estimated_nut_atleastonce_geno_preg) #dropped
+```
+
+```{r how many had complete data on variables that may potentially influence nutrient intake}
+data2 <- merge(estimated_nut_atleastonce_geno_preg, pa_items, by = c("FID", "IID"))
+data2 <- merge(data2, ICD10.diag.med.binary, by = c("FID", "IID"))
+data2 <- merge(data2, noncancerSR.binary, by = c("FID", "IID"))
+data2 <- merge(data2, cancerSRBC.binary, by = c("FID", "IID"))
+data2 <- merge(data2, PRS, by = c("FID", "IID"))
+```
+
+```{r reformate}
+# wide to long 
+diet_new2 <- melt(setDT(data2),id=c("FID","IID","Anorexia.nervosa","ADHD","OCD","Educational.attainment","Schizophrenia","Alcohol.dependence","Major.depressive.disorder", "Autism.spectrum.disorder","Bipolar.disorder","Food.addiction","Persistent.thinness","Height","BMI","Lupus","Sex","Age","SES","PC1","PC2","PC3","PC4","PC5","PC6","batch","Centre","Menopause","Pregnant","Tobacco","freq.alcohol","Education","ICD10.disease","ICD10.drug","noncancerSR","SRAnyCancerBC"),measure = patterns("^Typical.diet.yesterday","^Special.diet","^Time.spent.doing.light.physical.activity","^Time.spent.doing.moderate.physical.activity","^Time.spent.doing.vigorous.physical.activity","^Protein","^Energy","^Alcohol","^Calcium","^Carbohydrate","^Carotene","^Englyst.dietary.fibre","^Fat","^Folate","^Food.weight","^Iron","^Magnesium","^Polyunsaturated.fat","^Potassium","^Retinol","^Saturated.fat","^Starch","^Total.sugars","^Vitamin.B12","^Vitamin.B6","^Vitamin.C","^Vitamin.D","^Vitamin.E"),value.name = c("Typical.diet.yesterday","Special.diet","Time.spent.doing.light.physical.activity","Time.spent.doing.moderate.physical.activity","Time.spent.doing.vigorous.physical.activity","Protein","Energy","Alcohol","Calcium","Carbohydrate","Carotene","Englyst.dietary.fibre","Fat","Folate","Food.weight","Iron","Magnesium","Polyunsaturated.fat","Potassium","Retinol","Saturated.fat","Starch","Total.sugars","Vitamin.B12","Vitamin.B6","Vitamin.C","Vitamin.D","Vitamin.E"))[,variable := NULL][]
+
+# as.data.frame
+diet_new2 <- as.data.frame(diet_new2)
+
+#remove NAs from data
+diet_new2.NAremoved <- na.omit(diet_new2)
+
+# number of individuals dropped due to missing data on variables that may potentially influence nutrient intake
+diet_new2_unique <- diet_new2.NAremoved[!duplicated(diet_new2.NAremoved$FID), ]
+
+nrow(diet_new2_unique) #retained
+nrow(estimated_nut_atleastonce_geno_preg) - nrow(diet_new2_unique) #dropped
+```
+
+# Multicollinearity check (Supplementary Figure 1 in Manuscript)
+```{r Heterogeneous correlation Matrix}
+# duplicate sample
+diet2 <- diet_new
+# remove id columns 
+diet2 <- select(diet2, nutrient_names)
+
+# heterogeneous correlation matrix on small subsample 
+cor_matrix <- hetcor(data = diet2, ML = FALSE, std.err = TRUE, 
+  use= "pairwise.complete.obs", bins=4, pd=TRUE)
+
+# Print the correlation matrix
+print(cor_matrix)
+
+# Save the correlations from the correlation matrix in an object
+cor.matrix.sumscores <- as.matrix(cor_matrix)
+
+# Save the p values from the correlation matrix in an object
+p.matrix.sumscores <- as.matrix(cor_matrix$tests)
+```
+
+```{r heat map}
+# Open a pdf file
+pdf("../results/diet.ukb.cor.matrix.pdf") 
+
+# Create heat map
+corrplot(cor.matrix.sumscores,
+         method = "color", # objects to represent the correlations on plot
+         type = "lower", # only use the lower triangle of the matrix
+         diag = FALSE, # do not show the correlations on the diagonal
+         addgrid.col = NA,
+         addCoef.col = "black", # colour for the correlation coefficients in the plot
+         tl.cex = 0.6,
+         number.cex = 0.2,
+         tl.col = "black",
+         col=colorRampPalette(c("dodgerblue4","white","firebrick4"))(200), # colours for correlations
+         # Combine with significance
+         p.mat = p.matrix.sumscores, # Matrix with p values
+         sig.level = 0.05, # Choose significant level
+         insig = "blank", # Nonsignificant correlations have no colour
+         na.label = "N"
+         )
+
+# Close the pdf file
+dev.off() 
+```
+
+```{r remove highly correlated variables}
+outcomes_extract <- c("Energy", "Starch", "Total.sugars" , "Polyunsaturated.fat", "Saturated.fat", "Retinol", "Magnesium", "Potassium")
+
+# replace var
+nutrient_names <- nutrient_names[!(nutrient_names %in% outcomes_extract)]
+var <- nutrient_names
+```
+
+# Descriptives (Table 4 in Manuscript)
+```{r Number of individuals}
+length(unique(diet_new$FID))
+```
+
+```{r Number of time points answered}
+diet_new$FID <- as.character(diet_new$FID)
+diet_new$count <- as.numeric(ave(diet_new$FID, diet_new$FID, FUN = length))
+
+# dataframe of non-duplicated ids
+nonduplicated_ids <- diet_new[!duplicated(diet_new$FID), ]
+table(nonduplicated_ids$count)
+diet_new$count <- NULL
+```
+
+```{r Age}
+descr(nonduplicated_ids$Age)
+```
+
+```{r Number of males and females}
+table(nonduplicated_ids$Sex)
+```
+
+```{r descriptive statistics: nutrient intake}
+descriptives <-  function(var) {
+df <- diet_new %>% select(., starts_with(var))
+descr(df, stats = "common", transpose = TRUE, headings = FALSE)
+}
+
+for (var in nutrient_names) {
+  print(descriptives(var = var))
+}
+```
+
+# Histogram plots (Supplementary Figure 2)
+```{r}
+# seperate nutrient intake by those with and without units containing greek mu symbol 
+nogreekunits <- c("Protein", "Alcohol", "Calcium" , "Carbohydrate", "Englyst.dietary.fibre", "Fat", "Food.weight", "Iron")                 
+
+greekunits <- c("Carotene", "Folate", "Vitamin.B12", "Vitamin.B6", "Vitamin.C", "Vitamin.D","Vitamin.E")   
+
+# plots 
+hist_density_plot_ngu <-  function(googlesheet = diet_sheet, var) {
+  
+    plot_data <- data.frame(diet_new$FID, diet_new$IID, diet_new[[var]])
+    colnames(plot_data)[3] <- "var"
+    unit <- diet_sheet[diet_sheet["Description"] == var,]["Units"] %>% unique()
+    title <- diet_sheet[diet_sheet["Description"] == var,]["Title"] %>% unique()
+    x_label <- diet_sheet[diet_sheet["Description"] == var,]["Description"] %>% unique()
+    x_label <- sub("\\.", " ", x_label)
+    x_label <- sub("\\.", " ", x_label)
+    
+    options(scipen=10000)
+
+ggplot(plot_data, aes(x=var)) + 
+ geom_histogram(aes(y=..density..), colour="black", fill="white", size = 0.3) +
+ geom_density(alpha=.2, size=0.3) +
+  geom_vline(aes(xintercept=mean(var)),
+            color="red", linetype="dashed", size=0.3) +
+   labs(title = title,
+        x = paste0(x_label, " ", unit)) +
+  theme_classic() +
+  theme(plot.title = element_text(size=8, face="bold"),
+        plot.subtitle = element_text(size=7),
+          axis.title.x = element_text(size=7),
+          axis.title.y = element_text(size=7)
+) 
+}
+
+hist_density_plot_ng <-  function(googlesheet = diet_sheet, var) {
+  
+    plot_data <- data.frame(diet_new$FID, diet_new$IID, diet_new[[var]])
+    colnames(plot_data)[3] <- "var"
+    title <- diet_sheet[diet_sheet["Description"] == var,]["Title"] %>% unique()
+    x_label <- diet_sheet[diet_sheet["Description"] == var,]["Description"] %>% unique()
+    x_label <- sub("\\.", " ", x_label)
+    x_label <- sub("\\.", " ", x_label)
+
+    options(scipen=10000)
+
+ggplot(plot_data, aes(x=var)) + 
+ geom_histogram(aes(y=..density..), colour="black", fill="white", size = 0.3) +
+ geom_density(alpha=.2, size=0.3) +
+  geom_vline(aes(xintercept=mean(var)),
+            color="red", linetype="dashed", size=0.3) +
+   labs(title = title,
+        x = as.expression(bquote(.(x_label) ~ mu * g))) +
+  theme_classic() +
+  theme(plot.title = element_text(size=8, face="bold"),
+        plot.subtitle = element_text(size=7),
+          axis.title.x = element_text(size=7),
+          axis.title.y = element_text(size=7)
+) 
+}
+
+#save plots in pdf
+pdf(file = "../results/descriptive.plots.nutrients.pdf")
+
+library(gridExtra)
+
+p = list()
+for(var in nogreekunits) {
+  p[[var]] = hist_density_plot_ngu(var = var)
+}
+
+for(var in greekunits) {
+  p[[var]] = hist_density_plot_ng(var = var)
+}
+
+do.call(grid.arrange,c(p, ncol=3))
+
+dev.off()
+```
+
+# linear mixed effects models
+```{r define predictor variables - psychatric phenotypes and educational attainment}
+phenotypes <- c("Anorexia.nervosa","ADHD","OCD","Educational.attainment","Schizophrenia","Alcohol.dependence","Major.depressive.disorder", "Autism.spectrum.disorder", "Bipolar.disorder", "Food.addiction","Persistent.thinness","Height", "BMI", "Body.fat.percentage", "Lupus") #Lupus negative control and Body.fat.percentage for sensitivity analysis 
+```
+
+```{r table functions}
+# For  output provided by lmer
+make_tab <- function(models) {
+  rows <- imap(models, function(m, n) {
+    vars <- str_split(n, "_") %>% unlist()
+    tibble(
+      PRS = vars[1], Variable = vars[2], Estimate = m[1],
+      se = m[2], p.value = m[5]
+    )
+  })
+  bind_rows(rows)
+}
+
+# For outout provided by r.squaredGLMM
+make_tab_r2 <- function(models) {
+  rows <- imap(models, function(m, n) {
+    vars <- str_split(n, "_") %>% unlist()
+    tibble(
+      PRS = vars[1], Variable = vars[2], R2m = m[1],
+      R2c = m[2]
+    )
+  })
+  bind_rows(rows)
+}
+
+# For outout provided by boot
+make_se <- function(models) {
+  rows <- imap(models, function(m, n) {
+    vars <- str_split(n, "_") %>% unlist()
+    tibble(
+      PRS = vars[1], Variable = vars[2], R2c.SE = m[1]
+    )
+  })
+  bind_rows(rows)
+}
+```
+
+```{r standardize data}
+diet_z <-diet_new %>% mutate(FID = as.character(FID)) %>% 
+  mutate(IID = as.character(IID)) %>% 
+  mutate_if(is.numeric,scale)
+
+#write.table(diet_z, file="../data_raw/diet_z.txt", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+Two Supplementary Figures - in Supplementary Figure 1 the fixed effects are seperated and in Supplementary Figure 2 they are nested (see Figure 3 in Manuscript)
+```{r Model 0 - Supplementary Figure 1 and 2 - sex, age, PC1-6}
+#lmer
+model_0_lmer <- function(googlesheet = diet_sheet, var, data) {
+  form <- reformulate(c(i, "Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6", "(1|FID)"), response = var)
+  output <- lmer(form, data = diet_z)
+  summary(output)$coefficients[2, ] %>%
+      as.vector()
+  }
+
+models <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    models[[paste(i, var, sep = "_")]] <- model_0_lmer(var = var)
+  }
+}
+
+model0 <- as.data.frame(make_tab(models))
+
+# adjusted R squared 
+rsquared0 <- function(googlesheet = diet_sheet, var, data) {
+  form <- reformulate(c(i, "Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6", "(1|FID)"), response = var)
+  output <- r.squaredGLMM(lmer(form, data = diet_z))
+  output %>%
+      as.vector()
+  }
+
+r2_0 <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    r2_0[[paste(i, var, sep = "_")]] <- rsquared0(var = var)
+  }
+}
+
+model0_r2 <- as.data.frame(make_tab_r2(r2_0))
+model0 <- merge(model0, model0_r2, by = c("PRS", "Variable"))
+#write.table(model0, file="../data_raw/model0.results", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+```{r Model 1 - Supplementary Figure 1 and 2 - sex, age, PC1-6, special diet, typical diet}
+model_1_lmer <- function(googlesheet = diet_sheet, var, data) {
+  form <- reformulate(c(i,"Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet", "(1|FID)"), response = var)
+  output <- lmer(form, data = diet_z)
+  summary(output)$coefficients[2, ] %>%
+      as.vector()
+  }
+
+models <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    models[[paste(i, var, sep = "_")]] <- model_1_lmer(var = var)
+  }
+}
+
+model1 <- as.data.frame(make_tab(models))
+
+# adjusted R squared 
+rsquared1 <- function(googlesheet = diet_sheet, var, data) {
+  form <- reformulate(c(i, "Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet", "(1|FID)"), response = var)
+  output <- r.squaredGLMM(lmer(form, data = diet_z))
+  output %>%
+      as.vector()
+  }
+
+r2_1 <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    r2_1[[paste(i, var, sep = "_")]] <- rsquared1(var = var)
+  }
+}
+
+model1_r2 <- as.data.frame(make_tab_r2(r2_1))
+
+#merge
+model1 <- merge(model1, model1_r2, by = c("PRS", "Variable"))
+```
+
+```{r Model 2 - Supplementary Figure 1 and 2 - sex, age, PC1-6, special diet, typical diet + SES and EA}
+
+model_2_lmer <- function(googlesheet = diet_sheet, var, data) {
+  form <- reformulate(c(i,"Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6  + Typical.diet.yesterday + Special.diet + SES + Education", "(1|FID)"), response = var)
+  output <- lmer(form, data = diet_z)
+   summary(output)$coefficients[2, ] %>%
+      as.vector()
+}
+
+models <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    models[[paste(i, var, sep = "_")]] <- model_2_lmer(var = var)
+  }
+}
+
+model2 <- as.data.frame(make_tab(models))
+
+# adjusted R squared 
+rsquared2 <- function(googlesheet = diet_sheet, var, data) {
+  form <- reformulate(c(i, "Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet + SES + Education", "(1|FID)"), response = var)
+  output <- r.squaredGLMM(lmer(form, data = diet_z))
+  output %>%
+      as.vector()
+  }
+
+r2_2 <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    r2_2[[paste(i, var, sep = "_")]] <- rsquared2(var = var)
+  }
+}
+
+model2_r2 <- as.data.frame(make_tab_r2(r2_2))
+
+#merge
+model2 <- merge(model2, model2_r2, by = c("PRS", "Variable"))
+```
+
+```{r Model 3 - Supplementary Figure 1 - sex, age, PC1-6, special diet, typical diet + physical activity}
+model_3_f1_lmer <- function(googlesheet = diet_sheet, var, data) {
+  form <- reformulate(c(i,"Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet + Time.spent.doing.light.physical.activity + Time.spent.doing.moderate.physical.activity + Time.spent.doing.vigorous.physical.activity", "(1|FID)"), response = var)
+  output <- lmer(form, data = diet_z)
+  summary(output)$coefficients[2, ] %>%
+      as.vector()
+}
+
+models <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    models[[paste(i, var, sep = "_")]] <- model_3_f1_lmer(var = var)
+  }
+}
+
+model3f1 <- as.data.frame(make_tab(models))
+
+# adjusted R squared 
+rsquared3 <- function(googlesheet = diet_sheet, var, data) {
+  form <- reformulate(c(i, "Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet + Time.spent.doing.light.physical.activity + Time.spent.doing.moderate.physical.activity + Time.spent.doing.vigorous.physical.activity", "(1|FID)"), response = var)
+  output <- r.squaredGLMM(lmer(form, data = diet_z))
+  output %>%
+      as.vector()
+}
+
+r2_3 <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    r2_3[[paste(i, var, sep = "_")]] <- rsquared3(var = var)
+  }
+}
+
+model3_r2 <- as.data.frame(make_tab_r2(r2_3))
+
+#merge
+model3f1 <- merge(model3f1, model3_r2, by = c("PRS", "Variable"))
+```
+
+```{r model 4 - Supplementary Figure 1 - sex, age, PC1-6, special diet, typical diet + diagnoses and medication that affect food intake, smoking and alcohol consumption}
+model_4_f1_lmer <- function(googlesheet = diet_sheet, var, data) {
+  form <- reformulate(c(i,"Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet + Tobacco + freq.alcohol + ICD10.disease + ICD10.drug + noncancerSR + SRAnyCancerBC", "(1|FID)"), response = var)
+  output <- lmer(form, data = diet_z)
+  summary(output)$coefficients[2, ] %>%
+      as.vector()
+}
+
+models <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    models[[paste(i, var, sep = "_")]] <- model_4_f1_lmer(var = var)
+  }
+}
+
+model4f1 <- as.data.frame(make_tab(models))
+
+# adjusted R squared 
+rsquared4f1 <- function(googlesheet = diet_sheet, var, data) {
+  form <- reformulate(c(i, "Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet + Tobacco + freq.alcohol + ICD10.disease + ICD10.drug + noncancerSR + SRAnyCancerBC", "(1|FID)"), response = var)
+  output <- r.squaredGLMM(lmer(form, data = diet_z))
+  output %>%
+      as.vector()
+  }
+
+r2_4f1 <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    r2_4f1[[paste(i, var, sep = "_")]] <- rsquared4f1(var = var)
+  }
+}
+
+model4_r2f1 <- as.data.frame(make_tab_r2(r2_4f1))
+
+#merge
+model4f1 <- merge(model4f1, model4_r2f1, by = c("PRS", "Variable"))
+```
+
+```{r model 5 - Supplementary Figure 1 - all covariates}
+model_5_f1_lmer <- function(googlesheet = diet_sheet, var, data) {
+  form <- reformulate(c(i,"Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet + SES + Education + Time.spent.doing.light.physical.activity + Time.spent.doing.moderate.physical.activity + Time.spent.doing.vigorous.physical.activity + Tobacco + freq.alcohol + ICD10.disease + ICD10.drug + noncancerSR + SRAnyCancerBC", "(1|FID)"), response = var)
+  output <- lmer(form, data = diet_z)
+  summary(output)$coefficients[2, ] %>%
+      as.vector()
+}
+
+models <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    models[[paste(i, var, sep = "_")]] <- model_5_f1_lmer(var = var)
+  }
+}
+
+model5f1 <- as.data.frame(make_tab(models))
+
+# adjusted R squared 
+rsquared5f1 <- function(googlesheet = diet_sheet, var, data) {
+  form <- reformulate(c(i, "Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet + SES + Education + Time.spent.doing.light.physical.activity + Time.spent.doing.moderate.physical.activity + Time.spent.doing.vigorous.physical.activity + Tobacco + freq.alcohol + ICD10.disease + ICD10.drug + noncancerSR + SRAnyCancerBC", "(1|FID)"), response = var)
+  output <- r.squaredGLMM(lmer(form, data = diet_z))
+  output %>%
+      as.vector()
+  }
+
+r2_5f1 <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    r2_5f1[[paste(i, var, sep = "_")]] <- rsquared5f1(var = var)
+  }
+}
+
+model5_r2f1 <- as.data.frame(make_tab_r2(r2_5f1))
+
+#merge
+model5f1 <- merge(model5f1, model5_r2f1, by = c("PRS", "Variable"))
+```
+
+```{r bind all model outputs for figure 1}
+model0["Model"] <- 0
+model1["Model"] <- 1
+model2["Model"] <- 2
+model3f1["Model"] <- 3
+model4f1["Model"] <- 4
+model5f1["Model"] <- 5
+
+figure1.allmodels <- bind_rows(model0, model1, model2, model3f1, model4f1, model5f1)
+#write.table(figure1.allmodels, file="../data_raw/supplementary.figure.1.models", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+```{r model 3 - Supplementary Figure 2 - sex, age, PC1-6, special diet, typical diet SES + EA + diagnoses and medication that affect food intake, smoking and alcohol consumption}
+model_3_f2_lmer <- function(googlesheet = diet_sheet, var, data) {
+  
+  form <- reformulate(c(i,"Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet + SES + Education + Tobacco + freq.alcohol + ICD10.disease + ICD10.drug + noncancerSR + SRAnyCancerBC", "(1|FID)"), response = var)
+  output <- lmer(form, data = diet_z)
+  summary(output)$coefficients[2, ] %>%
+      as.vector()
+}
+
+models <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    models[[paste(i, var, sep = "_")]] <- model_3_f2_lmer(var = var)
+  }
+}
+
+model3f2 <- as.data.frame(make_tab(models))
+
+# adjusted R squared 
+rsquared3f2<- function(googlesheet = diet_sheet, var, data) {
+  form <- reformulate(c(i, "Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet + SES + Education + Tobacco + freq.alcohol + ICD10.disease + ICD10.drug + noncancerSR + SRAnyCancerBC", "(1|FID)"), response = var)
+  output <- r.squaredGLMM(lmer(form, data = diet_z))
+  output %>%
+      as.vector()
+
+  }
+
+r2_3f2 <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    r2_3f2[[paste(i, var, sep = "_")]] <- rsquared3f2(var = var)
+  }
+}
+
+model3_r2f2 <- as.data.frame(make_tab_r2(r2_3f2))
+
+#merge
+model3f2 <- merge(model3f2, model3_r2f2, by = c("PRS", "Variable"))
+```
+
+```{r model 4 - SupplementaryFigure 2 - sex, age, PC1-6, special diet, typical diet SES + EA + diagnoses and medication that affect food intake, smoking and alcohol consumption + physical activity} 
+model_4_f2_lmer <- function(googlesheet = diet_sheet, var, data) {
+  form <- reformulate(c(i,"Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet + SES + Education + Tobacco + freq.alcohol + ICD10.disease + ICD10.drug + noncancerSR + SRAnyCancerBC + Time.spent.doing.light.physical.activity + Time.spent.doing.moderate.physical.activity + Time.spent.doing.vigorous.physical.activity", "(1|FID)"), response = var)
+  output <- lmer(form, data = diet_z)
+  summary(output)$coefficients[2, ] %>%
+      as.vector()
+}
+
+models <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    models[[paste(i, var, sep = "_")]] <- model_4_f2_lmer(var = var)
+  }
+}
+
+model4f2 <- as.data.frame(make_tab(models))
+
+# adjusted R squared 
+rsquared4f2<- function(googlesheet = diet_sheet, var, data) {
+  
+  form <- reformulate(c(i, "Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet + SES + Education + Tobacco + freq.alcohol + ICD10.disease + ICD10.drug + noncancerSR + SRAnyCancerBC + Time.spent.doing.light.physical.activity + Time.spent.doing.moderate.physical.activity + Time.spent.doing.vigorous.physical.activity", "(1|FID)"), response = var)
+  output <- r.squaredGLMM(lmer(form, data = diet_z))
+  output %>%
+      as.vector()
+  }
+
+r2_4f2 <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    r2_4f2[[paste(i, var, sep = "_")]] <- rsquared4f2(var = var)
+  }
+}
+
+model4_r2f2 <- as.data.frame(make_tab_r2(r2_4f2))
+
+#merge
+model4f2 <- merge(model4f2, model4_r2f2, by = c("PRS", "Variable"))
+```
+
+```{r bind all model outputs for figure 2}
+model3f2["Model"] <- 3
+model4f2["Model"] <- 4
+
+figure2.allmodels <- bind_rows(model0, model1, model2, model3f2, model4f2)
+#write.table(figure2.allmodels, file="../data_raw/supplementary.figure.2.models", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+#Function to obtain SE for R-Squared - boot 
+data <- diet_z
+rsq <- function(formula, data, indices) {
+  d <- data[indices,] 
+  model.fit <- lmer(formula, data = d)
+  fit.r.squared <- r.squaredGLMM(model.fit)
+  return(fit.r.squared[,2])
+}
+
+set.seed(321)
+sder <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    
+results <- boot(data=data, statistic=rsq, 
+   R=100, formula=reformulate(c(i, "Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6", "(1|FID)"), response = var))
+
+sder[[paste(i, var, sep = "_")]] <- sd(results$t)
+  }
+}
+
+model0.r2.se <- as.data.frame(make_se(sder))
+
+```{r relaod models}
+figure1.allmodels <- fread("../data_raw/supplementary.figure.1.models", data.table = F)
+figure2.allmodels <- fread("../data_raw/supplementary.figure.2.models", data.table = F)
+
+#load 
+se0 <- fread("../data_raw/model0.r2.se.txt", data.table = F)
+se1 <- fread("../data_raw/model1.r2.se.txt", data.table = F)
+se2 <- fread("../data_raw/model2.r2.se.txt", data.table = F)
+se3f1 <- fread("../data_raw/model3.f1.r2.se.txt", data.table = F)
+se4f1 <- fread("../data_raw/model4.f1.r2.se.txt", data.table = F)
+se5f1 <- fread("../data_raw/model5.f1.r2.se.txt", data.table = F)
+se3f2 <- fread("../data_raw/model3.f2.r2.se.txt", data.table = F)
+se4f2 <- fread("../data_raw/model4.f2.r2.se.txt", data.table = F)
+
+se0["Model"] <- 0
+se1["Model"] <- 1
+se2["Model"] <- 2
+se3f1["Model"] <- 3
+se4f1["Model"] <- 4
+se5f1["Model"] <- 5
+figure1.all.r2.se <- bind_rows(se0, se1, se2, se3f1, se4f1, se5f1)
+
+se3f2["Model"] <- 3
+se4f2["Model"] <- 4
+figure2.all.r2.se <- bind_rows(se0, se1, se2, se3f2, se4f2)
+
+figure1.allmodels <- merge(figure1.allmodels, figure1.all.r2.se, by = c("PRS", "Variable", "Model"))
+figure2.allmodels <- merge(figure2.allmodels, figure2.all.r2.se, by = c("PRS", "Variable", "Model"))
+
+#write.table(figure1.allmodels, file="../data_raw/supplementary.figure.1.models.r2.se.included", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+#write.table(figure2.allmodels, file="../data_raw/supplementary.figure.2.models.r2.se.included", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+# Number of independent tests 
+```{r create dataframe}
+pred_out <- diet_new[, c("Anorexia.nervosa",
+                         "ADHD",
+                         "OCD",
+                         "Educational.attainment",
+                         "Schizophrenia",
+                         "Alcohol.dependence",
+                         "Major.depressive.disorder",
+                         "Autism.spectrum.disorder",
+                         "Bipolar.disorder",
+                         "Food.addiction",
+                         "Persistent.thinness",
+                         "Height",
+                         "BMI",
+                         "Lupus",
+                         "Protein",
+                         "Alcohol",
+                         "Calcium",
+                         "Carbohydrate",
+                         "Carotene",
+                         "Englyst.dietary.fibre",
+                         "Fat",
+                         "Folate",
+                         "Food.weight",
+                         "Iron",
+                         "Vitamin.B12",
+                         "Vitamin.B6",
+                         "Vitamin.C",
+                         "Vitamin.D",
+                         "Vitamin.E")]
+```
+
+```{r correlation matrix}
+cor_indept <- cor(pred_out)
+#save correlation matrix in csv format with no header.
+#write.csv(cor_indept,'../data_raw/correlation.matrix.for.indepedent.tests.csv', col.names =  FALSE)
+```
+Ran helena gaspers python script (https://github.com/hagax8/independent_tests) to calculate number of independent tests 
+Output: 
+Internal dimension of kernel matrix (N): 24
+Number of individual tests ((N*N-N)/2): 276.0
+Bonferroni cut-off: 1.81e-04
+24 x 5 models: 120 independent tests (all other models are sensitivity analyses)
+
+# Variance explained by PRS
+Cited in papers
+•	ADHD - 5.5% 
+•	Autism - 2.5%
+•	Anorexia - 1.7%
+•	Bipolar - 8% 
+•	MDD - 1.9% 
+•	Educational attainment - 11%
+•	OCD - 0.6%
+•	Persistent thinness – 4.3%
+•	Schizophrenia - 7%
+
+Checked in UKB - Height, BMI, Lupus, food addition, alcohol dependence
+•	Height - 5.1%
+•	BMI – 4.7% 
+•	Lupus – 2.8% (obtained running PRSice)
+•	Alcohol dependece – 1.6% (obtained running PRSice)
+•	Food addiction – 1% (our estimate)
+
+```{r variance explained by height and BMI polygenic score}
+#load data 
+bmi_height_rawdata <- fread("../data_raw/height.bmi.txt", data.table = F, header = T)
+
+#select and rename height and BMI polygenic score columns in PRS dataframe
+bmi_height_PRS <- PRS[c("FID", "IID", "Height", "BMI")]
+colnames(bmi_height_PRS) <- c("FID", "IID", "Height.PRS", "BMI.PRS")
+
+# merge
+bmi_height <- merge(bmi_height_rawdata, bmi_height_PRS, by = c("FID", "IID"))
+
+#height - variance explained
+lm.height <- lm(Height ~ Height.PRS, data = bmi_height)
+summary(lm.height)
+
+#BMI - variance explained
+lm.bmi <- lm(BMI ~ BMI.PRS, data = bmi_height)
+summary(lm.bmi)
+```
+
+```{r controls for lupus and alcohol dependence}
+# identify those that report 0 in noncancerSR and ICD10 columns
+controls<- merge(noncancerSR, ICD10, by = c("FID", "IID"))
+controls<-subset(controls, is.na(controls$Diagnoses.main.ICD10.0.0) & is.na(controls$Diagnoses.secondary.ICD10.0.0) & is.na(controls$Non.cancer.illness.code.self.reported.0.0)) 
+
+# controls for alcohol dependence and lupus
+controls$Alcohol.dependence <- 0
+controls$Lupus <- 0
+controls.ad <- controls[c("FID", "IID", "Alcohol.dependence")]
+controls.l <- controls[c("FID", "IID", "Lupus")]
+```
+
+```{r Alcohol dependence - variance explained}
+alcohol_dependence_sr_ICD10 <- noncancerSR[c("FID", "IID")]
+
+#self-reported 
+alcohol.dependence = c(1408, 1604)
+alcohol_dependence_sr_ICD10$alcohol.dependence.sr <- NA
+
+# Any visit
+alcohol_dependence_sr_ICD10$alcohol.dependence.sr <- 
+  with(noncancerSR, ifelse(!(Non.cancer.illness.code.self.reported.0.0 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.0.1 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.0.2 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.0.3 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.0.4 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.0.5 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.0.6 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.0.7 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.0.8 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.0.9 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.0.10 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.0.11 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.0.12 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.0.13 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.0.14 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.0.15 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.0.16 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.0.17 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.0.18 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.0.19 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.0.20 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.0.21 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.0.22 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.0.23 %in% alcohol.dependence) & 
+           !(Non.cancer.illness.code.self.reported.0.24 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.0.25 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.0.26 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.0.27 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.0.28 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.1.0 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.1.1 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.1.2 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.1.3 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.1.4 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.1.5 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.1.6 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.1.7 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.1.8 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.1.9 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.1.10 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.1.11 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.1.12 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.1.13 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.1.14 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.1.15 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.2.0 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.2.1 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.2.2 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.2.3 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.2.4 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.2.5 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.2.6 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.2.7 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.2.8 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.2.9 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.2.10 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.2.11 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.2.12 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.2.13 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.2.14 %in% alcohol.dependence) &
+           !(Non.cancer.illness.code.self.reported.2.15 %in% alcohol.dependence) & !(Non.cancer.illness.code.self.reported.2.16 %in% alcohol.dependence),
+         0, 1))
+
+table(alcohol_dependence_sr_ICD10$alcohol.dependence.sr)
+
+#ICD10
+ICD10$alcohol_dependence_ICD10 <- apply(ICD10, 1, function(r) any(r %in% c('\\"E244\\"', '\\"F10\\"', '\\"G312\\"', '\\"G621\\"', '\\"G721\\"', '\\"I426\\"', '\\"K292\\"', '\\"K70\\"', '\\"K700\\"', '\\"K701\\"', '\\"K702\\"', '\\"K703\\"', '\\"K704\\"', '\\"K709\\"', '\\"K852\\"', '\\"K860\\"', '\\"O354\\"', '\\"P043\\"', '\\"Q860\\"', '\\"Z502\\"', '\\"Z714\\"')))
+
+alcohol_dependence_sr_ICD10$alcohol_dependence_ICD10 <- as.integer(as.logical(ICD10$alcohol_dependence_ICD10))
+
+#either
+alcohol_dependence_sr_ICD10["Alcohol.dependence"] <- NA
+alcohol_dependence_sr_ICD10 <- within(alcohol_dependence_sr_ICD10, Alcohol.dependence[alcohol_dependence_ICD10 == 1 | alcohol.dependence.sr == 1] <- 1)
+
+#clean dataframe
+alcohol_dependence_sr_ICD10 <- na.omit(alcohol_dependence_sr_ICD10[c(1,2,5)])
+alcohol_dependence_sr_ICD10 <- rbind(alcohol_dependence_sr_ICD10, controls.ad)
+alcohol_dependence_sr_ICD10 <- alcohol_dependence_sr_ICD10[!duplicated(alcohol_dependence_sr_ICD10$FID), ]
+
+#write.table(alcohol_dependence_sr_ICD10, file="../data_raw/alcohol_dependence.ukb", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+```{r Lupus}
+lupus_sr_ICD10 <- noncancerSR[c("FID", "IID")]
+
+#self-reported 
+lupus = 1381
+lupus_sr_ICD10$lupus.sr <- NA
+
+lupus_sr_ICD10$lupus.sr <- 
+  with(noncancerSR, ifelse(!(Non.cancer.illness.code.self.reported.0.0 %in% lupus) & !(Non.cancer.illness.code.self.reported.0.1 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.0.2 %in% lupus) & !(Non.cancer.illness.code.self.reported.0.3 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.0.4 %in% lupus) & !(Non.cancer.illness.code.self.reported.0.5 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.0.6 %in% lupus) & !(Non.cancer.illness.code.self.reported.0.7 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.0.8 %in% lupus) & !(Non.cancer.illness.code.self.reported.0.9 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.0.10 %in% lupus) & !(Non.cancer.illness.code.self.reported.0.11 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.0.12 %in% lupus) & !(Non.cancer.illness.code.self.reported.0.13 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.0.14 %in% lupus) & !(Non.cancer.illness.code.self.reported.0.15 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.0.16 %in% lupus) & !(Non.cancer.illness.code.self.reported.0.17 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.0.18 %in% lupus) & !(Non.cancer.illness.code.self.reported.0.19 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.0.20 %in% lupus) & !(Non.cancer.illness.code.self.reported.0.21 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.0.22 %in% lupus) & !(Non.cancer.illness.code.self.reported.0.23 %in% lupus) & 
+           !(Non.cancer.illness.code.self.reported.0.24 %in% lupus) & !(Non.cancer.illness.code.self.reported.0.25 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.0.26 %in% lupus) & !(Non.cancer.illness.code.self.reported.0.27 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.0.28 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.1.0 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.1.1 %in% lupus) & !(Non.cancer.illness.code.self.reported.1.2 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.1.3 %in% lupus) & !(Non.cancer.illness.code.self.reported.1.4 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.1.5 %in% lupus) & !(Non.cancer.illness.code.self.reported.1.6 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.1.7 %in% lupus) & !(Non.cancer.illness.code.self.reported.1.8 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.1.9 %in% lupus) & !(Non.cancer.illness.code.self.reported.1.10 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.1.11 %in% lupus) & !(Non.cancer.illness.code.self.reported.1.12 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.1.13 %in% lupus) & !(Non.cancer.illness.code.self.reported.1.14 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.1.15 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.2.0 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.2.1 %in% lupus) & !(Non.cancer.illness.code.self.reported.2.2 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.2.3 %in% lupus) & !(Non.cancer.illness.code.self.reported.2.4 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.2.5 %in% lupus) & !(Non.cancer.illness.code.self.reported.2.6 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.2.7 %in% lupus) & !(Non.cancer.illness.code.self.reported.2.8 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.2.9 %in% lupus) & !(Non.cancer.illness.code.self.reported.2.10 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.2.11 %in% lupus) & !(Non.cancer.illness.code.self.reported.2.12 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.2.13 %in% lupus) & !(Non.cancer.illness.code.self.reported.2.14 %in% lupus) &
+           !(Non.cancer.illness.code.self.reported.2.15 %in% lupus) & !(Non.cancer.illness.code.self.reported.2.16 %in% lupus),
+         0, 1))
+
+table(lupus_sr_ICD10$lupus.sr)
+
+#ICD10
+ICD10$Lupus_ICD10 <- apply(ICD10, 1, function(r) any(r %in% c('\\"L93\\"', '\\"L930\\"', '\\"L931\\"', '\\"L932\\"', '\\"M32\\"', '\\"M320\\"', '\\"M321\\"', '\\"M328\\"', '\\"M329\\"', '\\"M3290\\"')))
+lupus_sr_ICD10$lupus_ICD10 <- as.integer(as.logical(ICD10$Lupus_ICD10))
+
+#either
+lupus_sr_ICD10["Lupus"] <- NA
+lupus_sr_ICD10 <- within(lupus_sr_ICD10, Lupus[lupus_ICD10 == 1 | lupus.sr == 1] <- 1)
+
+#clean dataframe
+lupus_sr_ICD10 <- na.omit(lupus_sr_ICD10[c(1,2,5)])
+lupus_sr_ICD10 <- rbind(lupus_sr_ICD10, controls.l)
+
+#write.table(lupus_sr_ICD10, file="../data_raw/lupus.ukb", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+#Manuscript Figures
+
+load colorblind palette 
+```{r}
+#library("viridis")    
+```
+
+Figure 1 and 2
+```{r plot models 0 and 4 (Figure2 - excluding PA) only - scaled}
+plotdata <- fread("../data_raw/supplementary.figure.2.models.r2.se.included", data.table = F, header = T)
+plotdata <- subset(plotdata, plotdata$PRS != "Body.fat.percentage") #only needed for sensitivity analysis
+
+# divide standardised beta coefficent estimates and se by variance explain by PRS
+plotdata$variance.explained <- NA
+plotdata$variance.explained[which(plotdata$PRS == "Height")] <- 5
+plotdata$variance.explained[which(plotdata$PRS == "BMI")] <- 5
+plotdata$variance.explained[which(plotdata$PRS == "Anorexia.nervosa")] <- 1.7
+plotdata$variance.explained[which(plotdata$PRS == "ADHD")] <- 5.5
+plotdata$variance.explained[which(plotdata$PRS == "OCD")] <- 0.6
+plotdata$variance.explained[which(plotdata$PRS == "Educational.attainment")] <- 11
+plotdata$variance.explained[which(plotdata$PRS == "Schizophrenia")] <- 7
+plotdata$variance.explained[which(plotdata$PRS == "Major.depressive.disorder")] <- 1.9
+plotdata$variance.explained[which(plotdata$PRS == "Autism.spectrum.disorder")] <- 2.5
+plotdata$variance.explained[which(plotdata$PRS == "Bipolar.disorder")] <- 4
+plotdata$variance.explained[which(plotdata$PRS == "Food.addiction")] <- 1
+plotdata$variance.explained[which(plotdata$PRS == "Persistent.thinness")] <- 4.3
+plotdata$variance.explained[which(plotdata$PRS == "Lupus")] <- 2.8
+plotdata$variance.explained[which(plotdata$PRS == "Alcohol.dependence")] <- 1.6
+plotdata$scaled.r2 <- NA
+plotdata$scaled.r2.se <- NA
+plotdata$scaled.r2 <- plotdata$R2c / plotdata$variance.explained
+plotdata$scaled.r2.se <- plotdata$R2c.SE / plotdata$variance.explained
+plotdata$scaled.r2 <- ifelse(plotdata$Estimate < 0, (-1*plotdata$scaled.r2), plotdata$scaled.r2)
+
+# shorten long variable name
+plotdata$Variable[plotdata$Variable == "Englyst.dietary.fibre"] <- "Fibre"
+plotdata$PRS[plotdata$PRS == "Anorexia.nervosa"] <- "Anorexia.nervosa"
+
+# replace . with space 
+plotdata$Variable <- sub("\\.", " ", plotdata$Variable)
+plotdata$PRS <- sub("\\.", " ", plotdata$PRS)
+plotdata$PRS <- sub("\\.", " ", plotdata$PRS)
+
+# correct for the number of tests performed 
+plotdata$p.value.corrected <- NA
+plotdata$p.value.corrected[plotdata$p.value < 0.05/120] <- 0.05 
+plotdata$p.value.corrected[plotdata$p.value < 0.01/120] <- 0.01
+plotdata$p.value.corrected[plotdata$p.value < 0.001/120] <- 0.001
+
+# generate significance stars
+plotdata$significance <- stars.pval(plotdata$p.value.corrected)
+
+plotdata$Model <- factor(plotdata$Model, 
+                                      levels = c("0", "1", "2", "3", "4"), ordered = TRUE)
+
+plotdata <- subset(plotdata, plotdata$Model == 0 | plotdata$Model == 4)
+
+
+A <- subset(plotdata, plotdata$PRS == "Anorexia nervosa" | plotdata$PRS == "OCD" | plotdata$PRS == "Schizophrenia" | plotdata$PRS == "Bipolar disorder" | plotdata$PRS == "Major depressive disorder" | plotdata$PRS == "ADHD" | plotdata$PRS == "Autism spectrum disorder" | plotdata$PRS == "Alcohol dependence") 
+
+A$PRS <- factor(A$PRS,
+                levels = c("Schizophrenia", "Bipolar disorder",
+                           "ADHD", "Anorexia nervosa",
+                           "OCD", "Major depressive disorder",
+                           "Alcohol dependence", "Autism spectrum disorder"), ordered = TRUE)
+
+B <- subset(plotdata, plotdata$PRS == "Height" | plotdata$PRS == "BMI" | plotdata$PRS == "Educational attainment" | plotdata$PRS == "Food addiction" | plotdata$PRS == "Persistent thinness" | plotdata$PRS == "Lupus") 
+
+B$PRS <- factor(B$PRS,
+                levels = c("Food addiction", "Persistent thinness",
+                           "Height", "BMI",
+                           "Educational attainment", "Lupus"), ordered = TRUE)
+
+
+plotA <- ggplot(data = A, aes(x=Variable,
+                                y=scaled.r2, 
+                         fill=Model)) +
+  geom_bar(stat="identity", position = position_dodge(width = 0.9), width=1) +
+  geom_errorbar(aes(ymax=scaled.r2+scaled.r2.se, ymin=scaled.r2-scaled.r2.se),width=0.3, position = position_dodge(width = 0.9), size=0.2) +
+  facet_wrap(~PRS, ncol = 3) +
+  theme_bw() + 
+  geom_text((aes(y = ifelse(scaled.r2 < 0, 0, scaled.r2+scaled.r2.se), label = significance)),
+            position=position_dodge(width=0.9), 
+            hjust = -0.2,
+            vjust = 0.8,
+            size = 4, 
+            angle = 90)  +
+  scale_y_continuous(limits=c(-1,1)) +
+ theme(legend.position="top", 
+       strip.text.x = element_text(size = 10),
+        axis.text.x = element_text(size = 10, angle = 90, hjust = 1),
+        axis.title.y = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        axis.title.x = element_blank(),
+        legend.text = element_text(size = 10),
+        legend.title=element_text(face = "bold", size=10),
+        panel.grid.minor.y = element_blank(), 
+        panel.grid.major.y = element_blank(), 
+        plot.title = element_text(size = 10, face = "bold"),
+  plot.subtitle = element_text(size = 10)) +
+  labs(y= "R-squared (scaled by variance explained by PGS)") + 
+  scale_fill_manual(values=c("#0072B2", "#E69F00"), 
+                       name="Models",
+                       breaks=c("0", "4"),
+                       labels=c("Baseline", "Full")) 
+
+ggsave("../results/Figure.1.pdf", plotA, width=10, height = 8, limitsize = FALSE)
+
+plotB <- ggplot(data = B, aes(x=Variable,
+                                y=scaled.r2, 
+                         fill=Model)) +
+  geom_bar(stat="identity", position = position_dodge(width = 0.9), width=1) +
+  geom_errorbar(aes(ymax=scaled.r2+scaled.r2.se, ymin=scaled.r2-scaled.r2.se),width=0.3, position = position_dodge(width = 0.9), size=0.2) +
+  facet_wrap(~PRS, ncol = 3) +
+  theme_bw() + 
+  geom_text((aes(y = ifelse(scaled.r2 < 0, 0, scaled.r2+scaled.r2.se), label = significance)),
+            position=position_dodge(width=0.9), 
+            hjust = -0.2,
+            vjust = 0.8,
+            size = 4, 
+            angle = 90)  +
+  scale_y_continuous(limits=c(-1,0.8)) +
+ theme(legend.position="top", 
+       strip.text.x = element_text(size = 8),
+        axis.text.x = element_text(size = 8, angle = 90, hjust = 1),
+        axis.title.y = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.title=element_text(face = "bold", size=9),
+        panel.grid.minor.y = element_blank(), 
+        panel.grid.major.y = element_blank(), 
+        plot.title = element_text(size = 9, face = "bold"),
+  plot.subtitle = element_text(size = 8)) +
+  labs(y= "R-squared (scaled by variance explained by PGS)") + 
+  scale_fill_manual(values=c("#0072B2", "#E69F00"), 
+                       name="Models",
+                       breaks=c("0", "4"),
+                       labels=c("Baseline", "Full")) 
+
+ggsave("../results/Figure.2.pdf", plotB, width=9, height = 5.5, limitsize = FALSE)
+```
+
+Supplementary Figure 3
+```{r}
+# read in data
+plotdata <- fread("../data_raw/supplementary.figure.1.models.r2.se.included", data.table = F, header = T)
+plotdata <- subset(plotdata, plotdata$PRS != "Body.fat.percentage") #only needed for sensitivity analysis
+
+# divide standardised beta coefficent estimates and se by variance explain by PRS
+plotdata$variance.explained <- NA
+plotdata$variance.explained[which(plotdata$PRS == "Height")] <- 5
+plotdata$variance.explained[which(plotdata$PRS == "BMI")] <- 5
+plotdata$variance.explained[which(plotdata$PRS == "Anorexia.nervosa")] <- 1.7
+plotdata$variance.explained[which(plotdata$PRS == "ADHD")] <- 5.5
+plotdata$variance.explained[which(plotdata$PRS == "OCD")] <- 0.6
+plotdata$variance.explained[which(plotdata$PRS == "Educational.attainment")] <- 11
+plotdata$variance.explained[which(plotdata$PRS == "Schizophrenia")] <- 7
+plotdata$variance.explained[which(plotdata$PRS == "Major.depressive.disorder")] <- 1.9
+plotdata$variance.explained[which(plotdata$PRS == "Autism.spectrum.disorder")] <- 2.5
+plotdata$variance.explained[which(plotdata$PRS == "Bipolar.disorder")] <- 4
+plotdata$variance.explained[which(plotdata$PRS == "Food.addiction")] <- 1
+plotdata$variance.explained[which(plotdata$PRS == "Persistent.thinness")] <- 4.3
+plotdata$variance.explained[which(plotdata$PRS == "Lupus")] <- 2.8
+plotdata$variance.explained[which(plotdata$PRS == "Alcohol.dependence")] <- 1.6
+plotdata$scaled.r2 <- NA
+plotdata$scaled.r2.se <- NA
+plotdata$scaled.r2 <- plotdata$R2c / plotdata$variance.explained
+plotdata$scaled.r2.se <- plotdata$R2c.SE / plotdata$variance.explained
+plotdata$scaled.r2 <- ifelse(plotdata$Estimate < 0, (-1*plotdata$scaled.r2), plotdata$scaled.r2)
+
+# shorten long variable name
+plotdata$Variable[plotdata$Variable == "Englyst.dietary.fibre"] <- "Fibre"
+
+# replace . with space 
+plotdata$Variable <- sub("\\.", " ", plotdata$Variable)
+plotdata$PRS <- sub("\\.", " ", plotdata$PRS)
+plotdata$PRS <- sub("\\.", " ", plotdata$PRS)
+
+# correct for the number of tests performed 
+plotdata$p.value.corrected <- NA
+plotdata$p.value.corrected[plotdata$p.value < 0.05/120] <- 0.05 
+plotdata$p.value.corrected[plotdata$p.value < 0.01/120] <- 0.01
+plotdata$p.value.corrected[plotdata$p.value < 0.001/120] <- 0.001
+
+# generate significance stars
+plotdata$significance <- stars.pval(plotdata$p.value.corrected)
+
+plotdata$Variable <- factor(plotdata$Variable, 
+                                      levels = c("Alcohol", "Protein","Carbohydrate", "Fat", "Fibre","Food weight","Folate","Calcium","Carotene","Iron","Vitamin B12","Vitamin B6","Vitamin C","Vitamin D","Vitamin E"), ordered = TRUE)
+
+plotdata$Model <- factor(plotdata$Model, 
+                                      levels = c("0", "1", "2", "3", "4", "5"), ordered = TRUE)
+
+A <- subset(plotdata, plotdata$PRS == "Anorexia nervosa" | plotdata$PRS == "OCD" | plotdata$PRS == "Schizophrenia" | plotdata$PRS == "Bipolar disorder" | plotdata$PRS == "Major depressive disorder" | plotdata$PRS == "ADHD" | plotdata$PRS == "Autism spectrum disorder" | plotdata$PRS == "Alcohol dependence") 
+
+A$PRS <- factor(A$PRS,
+                levels = c("Schizophrenia", "Bipolar disorder",
+                           "ADHD", "Anorexia nervosa",
+                           "OCD", "Major depressive disorder",
+                           "Alcohol dependence", "Autism spectrum disorder"), ordered = TRUE)
+
+B <- subset(plotdata, plotdata$PRS == "Height" | plotdata$PRS == "BMI" | plotdata$PRS == "Educational attainment" | plotdata$PRS == "Food addiction" | plotdata$PRS == "Persistent thinness" | plotdata$PRS == "Lupus") 
+
+B$PRS <- factor(B$PRS,
+                levels = c("Food addiction", "Persistent thinness",
+                           "Height", "BMI",
+                           "Educational attainment", "Lupus"), ordered = TRUE)
+
+plotA <- ggplot(data = A, aes(x=Variable,
+                                y=scaled.r2, 
+                         fill=Model)) +
+  geom_bar(stat="identity", position = position_dodge(width = 0.9), width=1) +
+  geom_errorbar(aes(ymax=scaled.r2+scaled.r2.se, ymin=scaled.r2-scaled.r2.se),width=0.3, position = position_dodge(width = 0.9), size=0.2) +
+  facet_wrap(~PRS, ncol = 2) +
+  theme_bw() + 
+  geom_text((aes(y = ifelse(scaled.r2 < 0, 0, scaled.r2+scaled.r2.se), label = significance)),
+            position=position_dodge(width=0.9), 
+            hjust = -0.2,
+            vjust = 0.8,
+            size = 2, 
+            angle = 90) +
+  scale_y_continuous(limits=c(-1,1)) +
+  theme(legend.position="right",
+        strip.text.x = element_text(size = 8),
+        axis.text.x = element_text(size = 8, angle = 90, hjust = 1),
+        axis.title.y = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.title=element_text(face = "bold", size=9),
+        panel.grid.minor.y = element_blank(), 
+        panel.grid.major.y = element_blank(), 
+        plot.title = element_text(size = 9, face = "bold"),
+  plot.subtitle = element_text(size = 8)) +
+  labs(title = "A",
+       y= "R-squared (scaled by variance explained by PGS)") + 
+  scale_fill_viridis(discrete = T, option="plasma")
+
+ggsave("../results/supplementary.figure.3A.scaled.pdf", plotA, width=9, height = 8, limitsize = FALSE)
+
+plotB <- ggplot(data = B, aes(x=Variable,
+                                y=scaled.r2, 
+                         fill=Model)) +
+  geom_bar(stat="identity", position = position_dodge(width = 0.9), width=1) +
+  geom_errorbar(aes(ymax=scaled.r2+scaled.r2.se, ymin=scaled.r2-scaled.r2.se),width=0.3, position = position_dodge(width = 0.9), size=0.2) +
+  facet_wrap(~PRS, ncol = 2) +
+  theme_bw() + 
+  geom_text((aes(y = ifelse(scaled.r2 < 0, 0, scaled.r2+scaled.r2.se), label = significance)),
+            position=position_dodge(width=0.9), 
+            hjust = -0.2,
+            vjust = 0.8,
+            size = 2, 
+            angle = 90)  +
+  scale_y_continuous(limits=c(-1,1)) +
+ theme(legend.position="right", 
+       strip.text.x = element_text(size = 8),
+        axis.text.x = element_text(size = 8, angle = 90, hjust = 1),
+        axis.title.y = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.title=element_text(face = "bold", size=9),
+        panel.grid.minor.y = element_blank(), 
+        panel.grid.major.y = element_blank(), 
+        plot.title = element_text(size = 9, face = "bold"),
+  plot.subtitle = element_text(size = 8)) +
+  labs(title = "B",
+       y= "R-squared (scaled by variance explained by PGS)") + 
+  scale_fill_viridis(discrete = T, option="plasma")
+
+ggsave("../results/supplementary.figure.3B.scaled.pdf", plotB, width=9, height = 6.5, limitsize = FALSE)
+
+```
+
+Supplementary Figure 4
+```{r scale R2 by variance explained and split plot into A and B}
+# read in data again
+plotdata <- fread("../data_raw/supplementary.figure.2.models.r2.se.included", data.table = F, header = T)
+plotdata <- subset(plotdata, plotdata$PRS != "Body.fat.percentage") #only needed for sensitivity analysis
+
+# divide standardised beta coefficent estimates by variance explain by PRS
+plotdata$variance.explained <- NA
+plotdata$variance.explained[which(plotdata$PRS == "Height")] <- 5
+plotdata$variance.explained[which(plotdata$PRS == "BMI")] <- 5
+plotdata$variance.explained[which(plotdata$PRS == "Anorexia.nervosa")] <- 1.7
+plotdata$variance.explained[which(plotdata$PRS == "ADHD")] <- 5.5
+plotdata$variance.explained[which(plotdata$PRS == "OCD")] <- 0.6
+plotdata$variance.explained[which(plotdata$PRS == "Educational.attainment")] <- 11
+plotdata$variance.explained[which(plotdata$PRS == "Schizophrenia")] <- 7
+plotdata$variance.explained[which(plotdata$PRS == "Major.depressive.disorder")] <- 1.9
+plotdata$variance.explained[which(plotdata$PRS == "Autism.spectrum.disorder")] <- 2.5
+plotdata$variance.explained[which(plotdata$PRS == "Bipolar.disorder")] <- 4
+plotdata$variance.explained[which(plotdata$PRS == "Food.addiction")] <- 1
+plotdata$variance.explained[which(plotdata$PRS == "Persistent.thinness")] <- 4.3
+plotdata$variance.explained[which(plotdata$PRS == "Lupus")] <- 2.8
+plotdata$variance.explained[which(plotdata$PRS == "Alcohol.dependence")] <- 1.6
+plotdata$scaled.r2 <- NA
+plotdata$scaled.r2.se <- NA
+plotdata$scaled.r2 <- plotdata$R2c / plotdata$variance.explained
+plotdata$scaled.r2.se <- plotdata$R2c.SE / plotdata$variance.explained
+plotdata$scaled.r2 <- ifelse(plotdata$Estimate < 0, (-1*plotdata$scaled.r2), plotdata$scaled.r2)
+
+# shorten long variable name
+plotdata$Variable[plotdata$Variable == "Englyst.dietary.fibre"] <- "Fibre"
+
+# replace . with space 
+plotdata$Variable <- sub("\\.", " ", plotdata$Variable)
+plotdata$PRS <- sub("\\.", " ", plotdata$PRS)
+plotdata$PRS <- sub("\\.", " ", plotdata$PRS)
+
+# correct for the number of tests performed 
+plotdata$p.value.corrected <- NA
+plotdata$p.value.corrected[plotdata$p.value < 0.05/120] <- 0.05 
+plotdata$p.value.corrected[plotdata$p.value < 0.01/120] <- 0.01
+plotdata$p.value.corrected[plotdata$p.value < 0.001/120] <- 0.001
+
+# generate significance stars
+plotdata$significance <- stars.pval(plotdata$p.value.corrected)
+
+plotdata$Variable <- factor(plotdata$Variable, 
+                                      levels = c("Alcohol", "Protein","Carbohydrate", "Fat", "Fibre","Food weight","Folate","Calcium","Carotene","Iron","Vitamin B12","Vitamin B6","Vitamin C","Vitamin D","Vitamin E"), ordered = TRUE)
+
+
+plotdata$Model <- factor(plotdata$Model, 
+                                      levels = c("0", "1", "2", "3", "4"), ordered = TRUE)
+
+A <- subset(plotdata, plotdata$PRS == "Anorexia nervosa" | plotdata$PRS == "OCD" | plotdata$PRS == "Schizophrenia" | plotdata$PRS == "Bipolar disorder" | plotdata$PRS == "Major depressive disorder" | plotdata$PRS == "ADHD" | plotdata$PRS == "Autism spectrum disorder" | plotdata$PRS == "Alcohol dependence") 
+
+A$PRS <- factor(A$PRS,
+                levels = c("Schizophrenia", "Bipolar disorder",
+                           "ADHD", "Anorexia nervosa",
+                           "OCD", "Major depressive disorder",
+                           "Alcohol dependence", "Autism spectrum disorder"), ordered = TRUE)
+
+B <- subset(plotdata, plotdata$PRS == "Height" | plotdata$PRS == "BMI" | plotdata$PRS == "Educational attainment" | plotdata$PRS == "Food addiction" | plotdata$PRS == "Persistent thinness" | plotdata$PRS == "Lupus") 
+
+B$PRS <- factor(B$PRS,
+                levels = c("Food addiction", "Persistent thinness",
+                           "Height", "BMI",
+                           "Educational attainment", "Lupus"), ordered = TRUE)
+
+plotA <- ggplot(data = A, aes(x=Variable,
+                                y=scaled.r2, 
+                         fill=Model)) +
+  geom_bar(stat="identity", position = position_dodge(width = 0.9), width=1) +
+  geom_errorbar(aes(ymax=scaled.r2+scaled.r2.se, ymin=scaled.r2-scaled.r2.se),width=0.3, position = position_dodge(width = 0.9), size=0.2) +
+  facet_wrap(~PRS, ncol = 2) +
+  theme_bw() + 
+  geom_text((aes(y = ifelse(scaled.r2 < 0, 0, scaled.r2+scaled.r2.se), label = significance)),
+            position=position_dodge(width=0.9), 
+            hjust = -0.2,
+            vjust = 0.8,
+            size = 2, 
+            angle = 90)  +
+  scale_y_continuous(limits=c(-1,1)) +
+ theme(legend.position="right", 
+       strip.text.x = element_text(size = 8),
+        axis.text.x = element_text(size = 8, angle = 90, hjust = 1),
+        axis.title.y = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.title=element_text(face = "bold", size=9),
+        panel.grid.minor.y = element_blank(), 
+        panel.grid.major.y = element_blank(), 
+        plot.title = element_text(size = 9, face = "bold"),
+  plot.subtitle = element_text(size = 8)) +
+  labs(title = "A",
+       y= "R-squared (scaled by variance explained by PGS)") + 
+  scale_fill_viridis(discrete = T, option="plasma")
+
+ggsave("../results/supplementary.figure.4A.scaled.pdf", plotA, width=9, height = 8, limitsize = FALSE)
+
+plotB <- ggplot(data = B, aes(x=Variable,
+                                y=scaled.r2, 
+                         fill=Model)) +
+  geom_bar(stat="identity", position = position_dodge(width = 0.9), width=1) +
+  geom_errorbar(aes(ymax=scaled.r2+scaled.r2.se, ymin=scaled.r2-scaled.r2.se),width=0.3, position = position_dodge(width = 0.9), size=0.2) +
+  facet_wrap(~PRS, ncol = 2) +
+  theme_bw() + 
+  geom_text((aes(y = ifelse(scaled.r2 < 0, 0, scaled.r2+scaled.r2.se), label = significance)),
+            position=position_dodge(width=0.9), 
+            hjust = -0.2,
+            vjust = 0.8,
+            size = 2, 
+            angle = 90)  +
+  scale_y_continuous(limits=c(-1,1)) +
+ theme(legend.position="right", 
+       strip.text.x = element_text(size = 8),
+        axis.text.x = element_text(size = 8, angle = 90, hjust = 1),
+        axis.title.y = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.title=element_text(face = "bold", size=9),
+        panel.grid.minor.y = element_blank(), 
+        panel.grid.major.y = element_blank(), 
+        plot.title = element_text(size = 9, face = "bold"),
+  plot.subtitle = element_text(size = 8)) +
+  labs(title = "B",
+       y= "R-squared (scaled by variance explained by PGS)") + 
+  scale_fill_viridis(discrete = T, option="plasma")
+
+ggsave("../results/supplementary.figure.4B.scaled.pdf", plotB, width=9, height = 6.5, limitsize = FALSE)
+
+```
+
+Supplementary Figure 5
+```{r}
+# read in saved dataframe 
+plotdata <- fread("../data_raw/supplementary.figure.1.models.r2.se.included", data.table = F, header = T)
+plotdata <- subset(plotdata, plotdata$PRS != "Body.fat.percentage") #only needed for sensitivity analysis
+
+# shorten long variable name
+plotdata$Variable[plotdata$Variable == "Englyst.dietary.fibre"] <- "Fibre"
+
+# replace . with space 
+plotdata$Variable <- sub("\\.", " ", plotdata$Variable)
+plotdata$PRS <- sub("\\.", " ", plotdata$PRS)
+plotdata$PRS <- sub("\\.", " ", plotdata$PRS)
+
+# correct for the number of tests performed 
+plotdata$p.value.corrected <- NA
+
+plotdata$p.value.corrected[plotdata$p.value < 0.05/120] <- 0.05 
+plotdata$p.value.corrected[plotdata$p.value < 0.01/120] <- 0.01
+plotdata$p.value.corrected[plotdata$p.value < 0.001/120] <- 0.001
+
+# generate significance stars
+plotdata$significance <- stars.pval(plotdata$p.value.corrected)
+
+plotdata$Variable <- factor(plotdata$Variable, 
+                                      levels = c("Alcohol", "Protein","Carbohydrate", "Fat", "Fibre","Food weight","Folate","Calcium","Carotene","Iron","Vitamin B12","Vitamin B6","Vitamin C","Vitamin D","Vitamin E"), ordered = TRUE)
+
+plotdata$Model <- factor(plotdata$Model, 
+                                      levels = c("0", "1", "2", "3", "4", "5"), ordered = TRUE)
+
+A <- subset(plotdata, plotdata$PRS == "Anorexia nervosa" | plotdata$PRS == "OCD" | plotdata$PRS == "Schizophrenia" | plotdata$PRS == "Bipolar disorder" | plotdata$PRS == "Major depressive disorder" | plotdata$PRS == "ADHD" | plotdata$PRS == "Autism spectrum disorder" | plotdata$PRS == "Alcohol dependence") 
+
+A$PRS <- factor(A$PRS,
+                levels = c("Schizophrenia", "Bipolar disorder",
+                           "ADHD", "Anorexia nervosa",
+                           "OCD", "Major depressive disorder",
+                           "Alcohol dependence", "Autism spectrum disorder"), ordered = TRUE)
+
+B <- subset(plotdata, plotdata$PRS == "Height" | plotdata$PRS == "BMI" | plotdata$PRS == "Educational attainment" | plotdata$PRS == "Food addiction" | plotdata$PRS == "Persistent thinness" | plotdata$PRS == "Lupus") 
+
+B$PRS <- factor(B$PRS,
+                levels = c("Food addiction", "Persistent thinness",
+                           "Height", "BMI",
+                           "Educational attainment", "Lupus"), ordered = TRUE)
+
+plotA <- ggplot(data = A, aes(x=Variable,
+                                y=Estimate, 
+                         fill=Model)) +
+  geom_bar(stat="identity", position = position_dodge(width = 0.9), width=1) +
+  geom_errorbar(aes(ymax=Estimate+se, ymin=Estimate-se),width=0.3, position = position_dodge(width = 0.9), size=0.2) +
+  facet_wrap(~PRS, ncol = 2) +
+  theme_bw() + 
+  geom_text((aes(y = ifelse(Estimate < 0, 0, Estimate+se), label = significance)),
+            position=position_dodge(width=0.9), 
+            hjust = -0.2,
+            vjust = 0.8,
+            size = 2, 
+            angle = 90) +
+  scale_y_continuous(limits=c(-0.03,0.06)) +
+  theme(legend.position="right",
+        strip.text.x = element_text(size = 8),
+        axis.text.x = element_text(size = 8, angle = 90, hjust = 1),
+        axis.title.y = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.title=element_text(face = "bold", size=9),
+        panel.grid.minor.y = element_blank(), 
+        panel.grid.major.y = element_blank(), 
+        plot.title = element_text(size = 9, face = "bold"),
+  plot.subtitle = element_text(size = 8)) +
+  labs(title = "A", 
+       y= "Standardized coefficients",
+       x = "Estimated nutrients") + 
+  scale_fill_viridis(discrete = T, option="plasma")
+
+ggsave("../results/supplementary.figure.5A.pdf", plotA, width=9, height = 6.5, limitsize = FALSE)
+
+plotB <- ggplot(data = B, aes(x=Variable,
+                                y=Estimate, 
+                         fill=Model)) +
+  geom_bar(stat="identity", position = position_dodge(width = 0.9), width=1) +
+  geom_errorbar(aes(ymax=Estimate+se, ymin=Estimate-se),width=0.3, position = position_dodge(width = 0.9), size=0.2) +
+  facet_wrap(~PRS, ncol = 2) +
+  theme_bw() + 
+  geom_text((aes(y = ifelse(Estimate < 0, 0, Estimate+se), label = significance)),
+            position=position_dodge(width=0.9), 
+            hjust = -0.2,
+            vjust = 0.8,
+            size = 2, 
+            angle = 90) +
+  scale_y_continuous(limits=c(-0.03,0.06)) +
+  theme(legend.position="right",
+        strip.text.x = element_text(size = 8),
+        axis.text.x = element_text(size = 8, angle = 90, hjust = 1),
+        axis.title.y = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.title=element_text(face = "bold", size=9),
+        panel.grid.minor.y = element_blank(), 
+        panel.grid.major.y = element_blank(), 
+        plot.title = element_text(size = 9, face = "bold"),
+  plot.subtitle = element_text(size = 8)) +
+  labs(title = "B", 
+       y= "Standardized coefficients",
+       x = "Estimated nutrients") + 
+  scale_fill_viridis(discrete = T, option="plasma")
+
+ggsave("../results/supplementary.figure.5B.pdf", plotB, width=9, height = 6.5, limitsize = FALSE)
+
+```
+
+Supplementary Figure 6
+```{r}
+# read in saved dataframe 
+plotdata <- fread("../data_raw/supplementary.figure.2.models", data.table = F, header = T)
+plotdata <- subset(plotdata, plotdata$PRS != "Body.fat.percentage") #only needed for sensitivity analysis
+
+# shorten long variable name
+plotdata$Variable[plotdata$Variable == "Englyst.dietary.fibre"] <- "Fibre"
+
+# replace . with space 
+plotdata$Variable <- sub("\\.", " ", plotdata$Variable)
+plotdata$PRS <- sub("\\.", " ", plotdata$PRS)
+plotdata$PRS <- sub("\\.", " ", plotdata$PRS)
+
+# correct for the number of tests performed 
+plotdata$p.value.corrected <- NA
+plotdata$p.value.corrected[plotdata$p.value < 0.05/120] <- 0.05 
+plotdata$p.value.corrected[plotdata$p.value < 0.01/120] <- 0.01
+plotdata$p.value.corrected[plotdata$p.value < 0.001/120] <- 0.001
+
+# generate significance stars
+plotdata$significance <- stars.pval(plotdata$p.value.corrected)
+
+plotdata$Variable <- factor(plotdata$Variable, 
+                                      levels = c("Alcohol", "Protein","Carbohydrate", "Fat", "Fibre","Food weight","Folate","Calcium","Carotene","Iron","Vitamin B12","Vitamin B6","Vitamin C","Vitamin D","Vitamin E"), ordered = TRUE)
+
+plotdata$Model <- factor(plotdata$Model, 
+                                      levels = c("0", "1", "2", "3", "4"), ordered = TRUE)
+
+A <- subset(plotdata, plotdata$PRS == "Anorexia nervosa" | plotdata$PRS == "OCD" | plotdata$PRS == "Schizophrenia" | plotdata$PRS == "Bipolar disorder" | plotdata$PRS == "Major depressive disorder" | plotdata$PRS == "ADHD" | plotdata$PRS == "Autism spectrum disorder" | plotdata$PRS == "Alcohol dependence") 
+
+A$PRS <- factor(A$PRS,
+                levels = c("Schizophrenia", "Bipolar disorder",
+                           "ADHD", "Anorexia nervosa",
+                           "OCD", "Major depressive disorder",
+                           "Alcohol dependence", "Autism spectrum disorder"), ordered = TRUE)
+
+B <- subset(plotdata, plotdata$PRS == "Height" | plotdata$PRS == "BMI" | plotdata$PRS == "Educational attainment" | plotdata$PRS == "Food addiction" | plotdata$PRS == "Persistent thinness" | plotdata$PRS == "Lupus") 
+
+B$PRS <- factor(B$PRS,
+                levels = c("Food addiction", "Persistent thinness",
+                           "Height", "BMI",
+                           "Educational attainment", "Lupus"), ordered = TRUE)
+
+plotA <- ggplot(data = A, aes(x=Variable,
+                                y=Estimate, 
+                         fill=Model)) +
+  geom_bar(stat="identity", position = position_dodge(width = 0.9), width=1) +
+  geom_errorbar(aes(ymax=Estimate+se, ymin=Estimate-se),width=0.3, position = position_dodge(width = 0.9), size=0.2) +
+  facet_wrap(~PRS, ncol = 2) +
+  theme_bw() + 
+  geom_text((aes(y = ifelse(Estimate < 0, 0, Estimate+se), label = significance)),
+            position=position_dodge(width=0.9), 
+            hjust = -0.2,
+            vjust = 0.8,
+            size = 2, 
+            angle = 90) +
+  scale_y_continuous(limits=c(-0.03,0.06)) +
+  theme(legend.position="right",
+        strip.text.x = element_text(size = 8),
+        axis.text.x = element_text(size = 8, angle = 90, hjust = 1),
+        axis.title.y = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.title=element_text(face = "bold", size=9),
+        panel.grid.minor.y = element_blank(), 
+        panel.grid.major.y = element_blank(), 
+        plot.title = element_text(size = 9, face = "bold"),
+  plot.subtitle = element_text(size = 8)) +
+  labs(title = "A", 
+       y= "Standardized coefficients",
+       x = "Estimated nutrients") + 
+  scale_fill_viridis(discrete = T, option="plasma")
+
+ggsave("../results/supplementary.figure.6A.pdf", plotA, width=9, height = 6.5, limitsize = FALSE)
+
+plotB <- ggplot(data = B, aes(x=Variable,
+                                y=Estimate, 
+                         fill=Model)) +
+  geom_bar(stat="identity", position = position_dodge(width = 0.9), width=1) +
+  geom_errorbar(aes(ymax=Estimate+se, ymin=Estimate-se),width=0.3, position = position_dodge(width = 0.9), size=0.2) +
+  facet_wrap(~PRS, ncol = 2) +
+  theme_bw() + 
+  geom_text((aes(y = ifelse(Estimate < 0, 0, Estimate+se), label = significance)),
+            position=position_dodge(width=0.9), 
+            hjust = -0.2,
+            vjust = 0.8,
+            size = 2, 
+            angle = 90) +
+  scale_y_continuous(limits=c(-0.03,0.06)) +
+  theme(legend.position="right",
+        strip.text.x = element_text(size = 8),
+        axis.text.x = element_text(size = 8, angle = 90, hjust = 1),
+        axis.title.y = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.title=element_text(face = "bold", size=9),
+        panel.grid.minor.y = element_blank(), 
+        panel.grid.major.y = element_blank(), 
+        plot.title = element_text(size = 9, face = "bold"),
+  plot.subtitle = element_text(size = 8)) +
+  labs(title = "B", 
+       y= "Standardized coefficients",
+       x = "Estimated nutrients") + 
+  scale_fill_viridis(discrete = T, option="plasma")
+
+ggsave("../results/supplementary.figure.6B.pdf", plotB, width=9, height = 6.5, limitsize = FALSE)
+
+```
+
+# Linear mixed effects model - standardize PRS only 
+```{r standardize PRS only}
+#standardize data using scale function
+diet_z_PRS <- diet_new %>%
+  mutate_at(c("Anorexia.nervosa","ADHD","OCD","Educational.attainment","Schizophrenia","Alcohol.dependence","Major.depressive.disorder", "Autism.spectrum.disorder", "Bipolar.disorder", "Food.addiction","Persistent.thinness","Height", "BMI", "Lupus"), funs(c(scale(.))))
+```
+
+```{r Model 0 zPRS- Figure 1 and 2 - sex, age, PC1-6}
+model_0_lmer <- function(googlesheet = diet_sheet, var, data) {
+  
+  form <- reformulate(c(i,"Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6", "(1|FID)"), response = var)
+  output <- lmer(form, data = diet_z_PRS)
+  summary(output)$coefficients[2, ] %>%
+      as.vector()
+  }
+
+models <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    models[[paste(i, var, sep = "_")]] <- model_0_lmer(var = var)
+  }
+}
+
+# make table and save as dataframe 
+make_tab(models)
+model0.zPRS <- as.data.frame(make_tab(models))
+#write.table(model0.zPRS, file="../data_raw/model0.zPRS.only.results", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+```{r Model 1 - Figure 1 and 2 - sex, age, PC1-6, special diet, typical diet}
+model_1_lmer <- function(googlesheet = diet_sheet, var, data) {
+  
+  form <- reformulate(c(i,"Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet", "(1|FID)"), response = var)
+  output <- lmer(form, data = diet_z_PRS)
+  summary(output)$coefficients[2, ] %>%
+      as.vector()
+  }
+
+models <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    models[[paste(i, var, sep = "_")]] <- model_1_lmer(var = var)
+  }
+}
+
+# make table and save as dataframe 
+make_tab(models)
+model1.zPRS <- as.data.frame(make_tab(models))
+#write.table(model1.zPRS, file="../data_raw/model1.zPRS.only.results", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+```{r Model 2 - Figure 1 and 2 - sex, age, PC1-6, special diet, typical diet + SES and EA}
+model_2_lmer <- function(googlesheet = diet_sheet, var, data) {
+  
+  form <- reformulate(c(i,"Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6  + Typical.diet.yesterday + Special.diet + SES + Education", "(1|FID)"), response = var)
+  output <- lmer(form, data = diet_z_PRS)
+   summary(output)$coefficients[2, ] %>%
+      as.vector()
+}
+
+models <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    models[[paste(i, var, sep = "_")]] <- model_2_lmer(var = var)
+  }
+}
+
+# make table and save as dataframe
+make_tab(models)
+model2.zPRS <- as.data.frame(make_tab(models))
+#write.table(model2.zPRS, file="../data_raw/model2.zPRS.only.results", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+```{r Model 3 - Figure 1 - sex, age, PC1-6, special diet, typical diet + physical activity}
+model_3_f1_lmer <- function(googlesheet = diet_sheet, var, data) {
+  
+  form <- reformulate(c(i,"Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet + Time.spent.doing.light.physical.activity + Time.spent.doing.moderate.physical.activity + Time.spent.doing.vigorous.physical.activity", "(1|FID)"), response = var)
+  output <- lmer(form, data = diet_z_PRS)
+  summary(output)$coefficients[2, ] %>%
+      as.vector()
+}
+
+models <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    models[[paste(i, var, sep = "_")]] <- model_3_f1_lmer(var = var)
+  }
+}
+
+# make table and save as dataframe
+make_tab(models)
+model3f1.zPRS <- as.data.frame(make_tab(models))
+#write.table(model3f1.zPRS, file="../data_raw/model3f1.zPRS.only.results", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+```{r model 4 - Figure 1 - sex, age, PC1-6, special diet, typical diet + diagnoses and medication that affect food intake, smoking and alcohol consumption}
+model_4_f1_lmer <- function(googlesheet = diet_sheet, var, data) {
+  
+  form <- reformulate(c(i,"Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet + Tobacco + freq.alcohol + ICD10.disease + ICD10.drug + noncancerSR + SRAnyCancerBC", "(1|FID)"), response = var)
+  output <- lmer(form, data = diet_z_PRS)
+  summary(output)$coefficients[2, ] %>%
+      as.vector()
+}
+
+models <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    models[[paste(i, var, sep = "_")]] <- model_4_f1_lmer(var = var)
+  }
+}
+
+# make table and save as dataframe
+make_tab(models)
+model4f1.zPRS <- as.data.frame(make_tab(models))
+#write.table(model4f1.zPRS, file="../data_raw/model4f1.zPRS.only.results", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+```{r model 5 - Figure 1 - all covariates}
+model_5_f1_lmer <- function(googlesheet = diet_sheet, var, data) {
+  
+  form <- reformulate(c(i,"Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet + SES + Education + Time.spent.doing.light.physical.activity + Time.spent.doing.moderate.physical.activity + Time.spent.doing.vigorous.physical.activity + Tobacco + freq.alcohol + ICD10.disease + ICD10.drug + noncancerSR + SRAnyCancerBC", "(1|FID)"), response = var)
+  output <- lmer(form, data = diet_z_PRS)
+  summary(output)$coefficients[2, ] %>%
+      as.vector()
+}
+
+models <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    models[[paste(i, var, sep = "_")]] <- model_5_f1_lmer(var = var)
+  }
+}
+
+# make table and save as dataframe
+make_tab(models)
+model5f1.zPRS <- as.data.frame(make_tab(models))
+#write.table(model5f1.zPRS, file="../data_raw/model5f1.zPRS.only.results", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+```{r bind all model outputs for figure 1}
+model0.zPRS["Model"] <- 0
+model1.zPRS["Model"] <- 1
+model2.zPRS["Model"] <- 2
+model3f1.zPRS["Model"] <- 3
+model4f1.zPRS["Model"] <- 4
+model5f1.zPRS["Model"] <- 5
+
+figure1.allmodels.zPRS <- bind_rows(model0.zPRS, model1.zPRS, model2.zPRS, model3f1.zPRS, model4f1.zPRS, model5f1.zPRS)
+#write.table(figure1.allmodels.zPRS, file="../data_raw/supplementary.figure.1.zPRS.only.models", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+```{r model 3 - Figure 2 - sex, age, PC1-6, special diet, typical diet SES + EA + diagnoses and medication that affect food intake, smoking and alcohol consumption}
+model_3_f2_lmer <- function(googlesheet = diet_sheet, var, data) {
+  
+  form <- reformulate(c(i,"Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet + SES + Education + Tobacco + freq.alcohol + ICD10.disease + ICD10.drug + noncancerSR + SRAnyCancerBC", "(1|FID)"), response = var)
+  output <- lmer(form, data = diet_z_PRS)
+  summary(output)$coefficients[2, ] %>%
+      as.vector()
+}
+
+models <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    models[[paste(i, var, sep = "_")]] <- model_3_f2_lmer(var = var)
+  }
+}
+
+# make table and save as dataframe
+make_tab(models)
+model3f2.zPRS <- as.data.frame(make_tab(models))
+#write.table(model3f2.zPRS, file="../data_raw/model3f2.results", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+```{r model 4 - Figure 2 - sex, age, PC1-6, special diet, typical diet SES + EA + diagnoses and medication that affect food intake, smoking and alcohol consumption + physical activity} 
+model_4_f2_lmer <- function(googlesheet = diet_sheet, var, data) {
+  
+  form <- reformulate(c(i,"Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + Typical.diet.yesterday + Special.diet + SES + Education + Tobacco + freq.alcohol + ICD10.disease + ICD10.drug + noncancerSR + SRAnyCancerBC + Time.spent.doing.light.physical.activity + Time.spent.doing.moderate.physical.activity + Time.spent.doing.vigorous.physical.activity", "(1|FID)"), response = var)
+  output <- lmer(form, data = diet_z_PRS)
+  summary(output)$coefficients[2, ] %>%
+      as.vector()
+}
+
+models <- list()
+for (i in phenotypes) {
+  for (var in nutrient_names) {
+    models[[paste(i, var, sep = "_")]] <- model_4_f2_lmer(var = var)
+  }
+}
+
+# make table and save as dataframe
+make_tab(models)
+model4f2.zPRS <- as.data.frame(make_tab(models))
+#write.table(model4f2.zPRS, file="../data_raw/model4f2.zPRS.only.results", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+```{r bind all model outputs for figure 1}
+model0.zPRS["Model"] <- 0
+model1.zPRS["Model"] <- 1
+model2.zPRS["Model"] <- 2
+model3f2.zPRS["Model"] <- 3
+model4f2.zPRS["Model"] <- 4
+
+figure2.allmodels.zPRS <- bind_rows(model0.zPRS, model1.zPRS, model2.zPRS, model3f2.zPRS, model4f2.zPRS)
+#write.table(figure2.allmodels.zPRS, file="../data_raw/supplementary.figure.2.zPRS.only.models", sep=" ", row.names=FALSE, append=TRUE, quote = FALSE)
+```
+
+# Sensitivity analysis (BMI versus body fat %)
+```{r new bar plot}
+# read in saved dataframe 
+plotdata <- fread("../data_raw/supplementary.figure.1.models.r2.se.included", data.table = F, header = T)
+plotdata <- subset(plotdata, plotdata$PRS == "BMI" | plotdata$PRS == "Body.fat.percentage") 
+
+# shorten long variable name
+plotdata$Variable[plotdata$Variable == "Englyst.dietary.fibre"] <- "Fibre"
+
+# replace . with space 
+plotdata$Variable <- sub("\\.", " ", plotdata$Variable)
+plotdata$PRS <- sub("\\.", " ", plotdata$PRS)
+plotdata$PRS <- sub("\\.", " ", plotdata$PRS)
+
+# correct for the number of tests performed 
+plotdata$p.value.corrected <- NA
+plotdata$p.value.corrected[plotdata$p.value < 0.05/120] <- 0.05 
+plotdata$p.value.corrected[plotdata$p.value < 0.01/120] <- 0.01
+plotdata$p.value.corrected[plotdata$p.value < 0.001/120] <- 0.001
+
+# generate significance stars
+plotdata$significance <- stars.pval(plotdata$p.value.corrected)
+
+plotdata$Variable <- factor(plotdata$Variable, 
+                                      levels = c("Alcohol", "Protein","Carbohydrate", "Fat", "Fibre","Food weight","Folate","Calcium","Carotene","Iron","Vitamin B12","Vitamin B6","Vitamin C","Vitamin D","Vitamin E"), ordered = TRUE)
+
+plotdata$Model <- factor(plotdata$Model, 
+                                      levels = c("0", "1", "2", "3", "4", "5"), ordered = TRUE)
+
+plot <- ggplot(data = plotdata, aes(x=Variable,
+                                y=Estimate, 
+                         fill=Model)) +
+  geom_bar(stat="identity", position = position_dodge(width = 0.9), width=1) +
+  geom_errorbar(aes(ymax=Estimate+se, ymin=Estimate-se),width=0.3, position = position_dodge(width = 0.9), size=0.2) +
+  facet_wrap(~PRS, ncol = 1) +
+  theme_bw() + 
+  geom_text((aes(y = ifelse(Estimate < 0, 0, Estimate+se), label = significance)),
+            position=position_dodge(width=0.9), 
+            hjust = -0.2,
+            vjust = 0.8,
+            size = 2, 
+            angle = 90) +
+  scale_y_continuous(limits=c(-0.03,0.06)) +
+  theme(legend.position="right",
+        strip.text.x = element_text(size = 8),
+        axis.text.x = element_text(size = 8, angle = 90, hjust = 1),
+        axis.title.y = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.title=element_text(face = "bold", size=9),
+        panel.grid.minor.y = element_blank(), 
+        panel.grid.major.y = element_blank(), 
+        plot.title = element_text(size = 9, face = "bold"),
+  plot.subtitle = element_text(size = 8)) +
+  labs(y= "Standardized coefficients",
+       x = "Estimated nutrients") + 
+  scale_fill_viridis(discrete = T, option="plasma")
+
+ggsave("../results/supplementary.figure.7.pdf", plot, width=4, height = 3, limitsize = TRUE)
+```
+
